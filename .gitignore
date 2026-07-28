@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+extracted/previews/
+extracted/
+rus.traineddata
+data/*.sqlite*
+*.pdf
+.DS_Store
