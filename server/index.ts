@@ -20,6 +20,9 @@ const model = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const run = promisify(execFile);
 
+// Render terminates HTTPS at one reverse proxy. Trust exactly that hop so
+// express-rate-limit can safely identify the real client from X-Forwarded-For.
+app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "40kb" }));
 app.use("/api", rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: "draft-8" }));
@@ -213,14 +216,25 @@ app.post("/api/reference-answer", authRequired, async (request, response) => {
 
 app.post("/api/lectures/audio", authRequired, async (request, response) => {
   if (!client) return response.status(503).json({ error: "Добавь OPENAI_API_KEY в настройки сервера" });
-  const parsed = z.object({ question: z.string().min(5).max(3000) }).safeParse(request.body);
+  const parsed = z.object({
+    title: z.string().min(5).max(3000),
+    mode: z.enum(["question", "section"]).default("question"),
+    topics: z.array(z.string().min(3).max(2000)).max(60).optional()
+  }).safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: "Некорректная тема лекции" });
   try {
+    const isSection = parsed.data.mode === "section";
+    const source = isSection
+      ? `РАЗДЕЛ: ${parsed.data.title}\n\nВОПРОСЫ, КОТОРЫЕ НУЖНО СВЯЗНО РАСКРЫТЬ:\n${(parsed.data.topics || []).map((topic, index) => `${index + 1}. ${topic}`).join("\n")}`
+      : parsed.data.title;
     const lecture = await client.responses.create({
       model,
       reasoning: { effort: "low" },
-      instructions: `Напиши текст короткой учебной аудиолекции на русском языке по вопросу вступительного экзамена. Она должна длиться примерно 3–5 минут, начинаться сразу с объяснения темы и содержать определения, основные связи, классификации и важные особенности. Пиши связным разговорным текстом без markdown, таблиц, списков с номерами и служебных фраз. Термины и код проговаривай понятно на слух. Не выдумывай факты. В конце кратко повтори главное.`,
-      input: parsed.data.question
+      max_output_tokens: isSection ? 1900 : 1100,
+      instructions: isSection
+        ? `Напиши цельную расширенную учебную аудиолекцию на русском языке по разделу вступительного экзамена. Последовательно и логично раскрой каждый переданный вопрос, объединяя повторяющиеся пункты и явно проговаривая переходы между подтемами. Это должна быть полноценная лекция примерно на 8–12 минут, но текст обязан оставаться компактнее 1800 токенов для последующей озвучки. Начни сразу с содержания. Пиши связным разговорным текстом без markdown, таблиц, нумерованных списков и служебных фраз. Термины и код объясняй так, чтобы всё было понятно только на слух. Не пропускай переданные темы и не выдумывай факты. В конце повтори главные выводы.`
+        : `Напиши текст учебной аудиолекции на русском языке по одному вопросу вступительного экзамена. Она должна длиться примерно 3–5 минут, начинаться сразу с объяснения темы и содержать определения, основные связи, классификации и важные особенности. Пиши связным разговорным текстом без markdown, таблиц, списков с номерами и служебных фраз. Термины и код проговаривай понятно на слух. Не выдумывай факты. В конце кратко повтори главное.`,
+      input: source
     });
     const speech = await client.audio.speech.create({
       model: (process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts") as "gpt-4o-mini-tts",

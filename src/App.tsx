@@ -97,29 +97,53 @@ function Home({ done, navigate }: { done: number; navigate: (s: Screen, subject?
   </>;
 }
 
-type LectureTrack = { id: string; subject: string; section: string; title: string };
+type LectureTrack = { id: string; subject: string; section: string; title: string; mode: "question" | "section"; topics?: string[] };
 function Lectures({ onBack }: { onBack: () => void }) {
+  const [lectureMode, setLectureMode] = useState<"questions" | "sections">("questions");
   const [subjectId, setSubjectId] = useState("all"); const [sectionId, setSectionId] = useState("all");
   const [index, setIndex] = useState(() => Number(localStorage.getItem("exam-lecture-index") || 0));
   const [audioUrl, setAudioUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [speed, setSpeed] = useState(1);
   const audioRef = useRef<HTMLAudioElement>(null); const urlRef = useRef("");
   const sections = subjectId === "all" ? [] : questionBanks.find((bank) => bank.id === subjectId)?.sections || [];
-  const tracks = useMemo<LectureTrack[]>(() => questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId).flatMap((bank) => bank.sections.flatMap((section, sectionIndex) => section.questions.filter(() => sectionId === "all" || (subjectId !== "all" && String(sectionIndex) === sectionId)).map((title, questionIndex) => ({ id: `${bank.id}-${sectionIndex}-${questionIndex}`, subject: bank.title, section: section.title, title })))), [subjectId, sectionId]);
+  const tracks = useMemo<LectureTrack[]>(() => {
+    const banks = questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId);
+    if (lectureMode === "sections") return banks.flatMap((bank) => bank.sections
+      .map((section, sectionIndex) => ({
+        id: `full-section-${bank.id}-${sectionIndex}`,
+        subject: bank.title,
+        section: section.title,
+        title: `Полная лекция: ${section.title}`,
+        mode: "section" as const,
+        topics: section.questions,
+        sectionIndex
+      }))
+      .filter((track) => sectionId === "all" || (subjectId !== "all" && String(track.sectionIndex) === sectionId)));
+    return banks.flatMap((bank) => bank.sections.flatMap((section, sectionIndex) => section.questions
+      .filter(() => sectionId === "all" || (subjectId !== "all" && String(sectionIndex) === sectionId))
+      .map((title, questionIndex) => ({
+        id: `question-${bank.id}-${sectionIndex}-${questionIndex}`,
+        subject: bank.title,
+        section: section.title,
+        title,
+        mode: "question" as const
+      }))));
+  }, [lectureMode, subjectId, sectionId]);
   const currentIndex = tracks.length ? index % tracks.length : 0; const current = tracks[currentIndex];
-  useEffect(() => { setIndex(0); setAudioUrl(""); setError(""); }, [subjectId, sectionId]);
+  useEffect(() => { setIndex(0); setAudioUrl(""); setError(""); if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = ""; } }, [lectureMode, subjectId, sectionId]);
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
+  const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
   const prefetch = async (track: LectureTrack | undefined) => {
     if (!track || !("caches" in window)) return;
-    const cache = await caches.open("zachetka-lectures-v1"); const cacheKey = `/lecture-cache/${track.id}.mp3`; if (await cache.match(cacheKey)) return;
-    const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: track.title }) });
+    const cache = await caches.open("zachetka-lectures-v2"); const cacheKey = `/lecture-cache-v2/${track.id}.mp3`; if (await cache.match(cacheKey)) return;
+    const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)) });
     if (response.ok) await cache.put(cacheKey, response);
   };
   const load = async (nextIndex = currentIndex, autoplay = true) => {
     const track = tracks[nextIndex]; if (!track) return; setLoading(true); setError("");
     try {
-      const cache = "caches" in window ? await caches.open("zachetka-lectures-v1") : null; const cacheKey = `/lecture-cache/${track.id}.mp3`;
+      const cache = "caches" in window ? await caches.open("zachetka-lectures-v2") : null; const cacheKey = `/lecture-cache-v2/${track.id}.mp3`;
       let audioResponse = cache ? await cache.match(cacheKey) : undefined;
-      if (!audioResponse) { const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: track.title }) }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Аудио недоступно"); } audioResponse = response; if (cache) await cache.put(cacheKey, response.clone()); }
+      if (!audioResponse) { const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)) }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Аудио недоступно"); } audioResponse = response; if (cache) await cache.put(cacheKey, response.clone()); }
       const blob = await audioResponse.blob(); if (urlRef.current) URL.revokeObjectURL(urlRef.current); const url = URL.createObjectURL(blob); urlRef.current = url; setIndex(nextIndex); setAudioUrl(url); localStorage.setItem("exam-lecture-index", String(nextIndex));
       if ("mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: track.title, artist: track.section, album: track.subject });
       if (autoplay) window.setTimeout(() => audioRef.current?.play().catch(() => null), 50);
@@ -127,7 +151,25 @@ function Lectures({ onBack }: { onBack: () => void }) {
   };
   const move = (delta: number) => { if (!tracks.length) return; load((currentIndex + delta + tracks.length) % tracks.length); };
   useEffect(() => { if (!("mediaSession" in navigator)) return; navigator.mediaSession.setActionHandler("nexttrack", () => move(1)); navigator.mediaSession.setActionHandler("previoustrack", () => move(-1)); return () => { navigator.mediaSession.setActionHandler("nexttrack", null); navigator.mediaSession.setActionHandler("previoustrack", null); }; });
-  return <section className="lectures-page"><button className="back" onClick={onBack}>← На главную</button><div className="lecture-head"><div><p className="eyebrow">Фоновое обучение</p><h1>Лекции</h1><p>Выбери тему или включи всё подряд. После первого создания трек сохраняется на этом телефоне.</p></div><span>♫</span></div><div className="lecture-filters"><label>Предмет<select value={subjectId} onChange={(e) => { setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label><label>Тема<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => setSectionId(e.target.value)}><option value="all">Все темы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label></div>{current && <div className="lecture-player"><div className="lecture-number">{currentIndex + 1} / {tracks.length}</div><small>{current.subject} · {current.section}</small><h2>{current.title}</h2>{!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю первую лекцию…" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline onPlay={() => prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null)} onEnded={() => move(1)} onLoadedMetadata={() => { if (audioRef.current) audioRef.current.playbackRate = speed; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button onClick={() => move(1)}>Следующая →</button></div></>}{loading && audioUrl && <p className="lecture-loading">Готовлю следующий трек…</p>}{error && <p className="inline-error">{error}</p>}</div>}<div className="lecture-queue"><div className="section-title"><h2>Очередь</h2><span>{tracks.length} лекций</span></div>{tracks.slice(currentIndex, currentIndex + 12).map((track, offset) => <button className={offset === 0 ? "active" : ""} key={track.id} onClick={() => load(currentIndex + offset)}><span>{currentIndex + offset + 1}</span><div><small>{track.section}</small><strong>{track.title}</strong></div></button>)}</div></section>;
+  return <section className="lectures-page">
+    <button className="back" onClick={onBack}>← На главную</button>
+    <div className="lecture-head"><div><p className="eyebrow">Фоновое обучение</p><h1>Лекции</h1><p>Слушай отдельные вопросы подряд или одну цельную лекцию по всему разделу.</p></div><span>♫</span></div>
+    <div className="lecture-mode-tabs">
+      <button className={lectureMode === "questions" ? "active" : ""} onClick={() => setLectureMode("questions")}><strong>Все вопросы</strong><small>каждый вопрос — отдельный трек</small></button>
+      <button className={lectureMode === "sections" ? "active" : ""} onClick={() => setLectureMode("sections")}><strong>По разделам</strong><small>полноценная связная лекция</small></button>
+    </div>
+    <div className="lecture-filters">
+      <label>Предмет<select value={subjectId} onChange={(e) => { setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
+      <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => setSectionId(e.target.value)}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
+    </div>
+    {current && <div className="lecture-player">
+      <div className="lecture-number">{currentIndex + 1} / {tracks.length}</div><small>{current.subject} · {current.section}</small><h2>{current.title}</h2>
+      {current.mode === "section" && <p className="lecture-coverage">В этой лекции: {current.topics?.length || 0} вопросов раздела</p>}
+      {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline onPlay={() => prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null)} onEnded={() => move(1)} onLoadedMetadata={() => { if (audioRef.current) audioRef.current.playbackRate = speed; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button onClick={() => move(1)}>Следующая →</button></div></>}
+      {loading && audioUrl && <p className="lecture-loading">Готовлю следующий трек…</p>}{error && <p className="inline-error">{error}</p>}
+    </div>}
+    <div className="lecture-queue"><div className="section-title"><h2>{lectureMode === "questions" ? "Все вопросы" : "Все лекции по разделам"}</h2><span>{tracks.length} треков</span></div><div className="lecture-queue-list">{tracks.map((track, trackIndex) => <button className={trackIndex === currentIndex ? "active" : ""} key={track.id} onClick={() => load(trackIndex)}><span>{trackIndex + 1}</span><div><small>{track.subject} · {track.section}</small><strong>{track.title}</strong>{track.mode === "section" && <em>{track.topics?.length || 0} вопросов внутри</em>}</div></button>)}</div></div>
+  </section>;
 }
 
 function Learn({ subject, onBack }: { subject: Subject; onBack: () => void }) {
