@@ -4,7 +4,8 @@ import { rateLimit } from "express-rate-limit";
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import ffmpegPath from "ffmpeg-static";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -21,6 +22,29 @@ const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPE
 const run = promisify(execFile);
 const lectureAudioJobs = new Map<string, Promise<Buffer>>();
 const lectureCacheMaxBytes = Number(process.env.LECTURE_CACHE_MAX_BYTES || 800 * 1024 * 1024);
+const lectureAudioBitrate = process.env.LECTURE_AUDIO_BITRATE || "48k";
+
+const compressLectureAudio = async (source: Buffer) => {
+  if (!ffmpegPath) return source;
+  const directory = await mkdtemp(path.join(tmpdir(), "zachetka-audio-"));
+  const input = path.join(directory, "source.mp3");
+  const output = path.join(directory, "compressed.mp3");
+  try {
+    await writeFile(input, source);
+    await run(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-i", input,
+      "-map_metadata", "-1", "-ac", "1", "-ar", "24000",
+      "-codec:a", "libmp3lame", "-b:a", lectureAudioBitrate, "-y", output
+    ], { timeout: 120_000, maxBuffer: 100_000 });
+    const compressed = await readFile(output);
+    return compressed.length < source.length ? compressed : source;
+  } catch (error) {
+    console.error("Не удалось сжать аудиолекцию, сохраняю исходный MP3", error);
+    return source;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+};
 
 // Render terminates HTTPS at one reverse proxy. Trust exactly that hop so
 // express-rate-limit can safely identify the real client from X-Forwarded-For.
@@ -254,7 +278,7 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
       instructions: "Говори по-русски спокойно, ясно и доброжелательно, как преподаватель на лекции. Делай небольшие паузы между смысловыми частями.",
       response_format: "mp3"
     });
-    const audio = Buffer.from(await speech.arrayBuffer());
+    const audio = await compressLectureAudio(Buffer.from(await speech.arrayBuffer()));
       if (audio.length <= lectureCacheMaxBytes) {
         const usage = Number((await database.query<{ total: string }>("SELECT COALESCE(SUM(byte_size),0)::text AS total FROM lecture_audio")).rows[0]?.total || 0);
         let bytesToFree = usage + audio.length - lectureCacheMaxBytes;
@@ -277,6 +301,9 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
     response.send(audio);
   } catch (error) {
     console.error(error);
+    if ((error as { code?: string })?.code === "insufficient_quota") {
+      return response.status(402).json({ error: "Баланс OpenAI закончился; уже готовые аудио сохранены" });
+    }
     response.status(502).json({ error: "Не удалось подготовить аудиолекцию" });
   }
 });
