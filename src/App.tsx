@@ -134,14 +134,14 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
   const prefetch = async (track: LectureTrack | undefined) => {
     if (!track || !("caches" in window)) return;
-    const cache = await caches.open("zachetka-lectures-v2"); const cacheKey = `/lecture-cache-v2/${track.id}.mp3`; if (await cache.match(cacheKey)) return;
+    const cache = await caches.open("zachetka-lectures-v3"); const cacheKey = `/lecture-cache-v3/${track.id}.mp3`; if (await cache.match(cacheKey)) return;
     const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)) });
     if (response.ok) await cache.put(cacheKey, response);
   };
   const load = async (nextIndex = currentIndex, autoplay = true) => {
     const track = tracks[nextIndex]; if (!track) return; setLoading(true); setError("");
     try {
-      const cache = "caches" in window ? await caches.open("zachetka-lectures-v2") : null; const cacheKey = `/lecture-cache-v2/${track.id}.mp3`;
+      const cache = "caches" in window ? await caches.open("zachetka-lectures-v3") : null; const cacheKey = `/lecture-cache-v3/${track.id}.mp3`;
       let audioResponse = cache ? await cache.match(cacheKey) : undefined;
       if (!audioResponse) { const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)) }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Аудио недоступно"); } audioResponse = response; if (cache) await cache.put(cacheKey, response.clone()); }
       const blob = await audioResponse.blob(); if (urlRef.current) URL.revokeObjectURL(urlRef.current); const url = URL.createObjectURL(blob); urlRef.current = url; setIndex(nextIndex); setAudioUrl(url); localStorage.setItem("exam-lecture-index", String(nextIndex));
