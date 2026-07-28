@@ -142,7 +142,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
   const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
   const cacheLocation = (track: LectureTrack) => {
-    const version = track.mode === "section" ? "v4" : "v3";
+    const version = "v4";
     return { cacheName: `zachetka-lectures-${version}`, cacheKey: `/lecture-cache-${version}/${track.id}.mp3` };
   };
   const prefetch = async (track: LectureTrack | undefined) => {
