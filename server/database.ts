@@ -27,6 +27,15 @@ export const databaseReady = database.query(`
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS lecture_audio (
+    cache_key TEXT PRIMARY KEY,
+    audio BYTEA NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'audio/mpeg',
+    byte_size INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS lecture_audio_last_accessed_idx ON lecture_audio(last_accessed_at);
 `).then(() => undefined);
 
 export type DbUser = { id: number; username: string | null; telegram_id: string | null; display_name: string };

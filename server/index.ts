@@ -19,6 +19,8 @@ const port = Number(process.env.PORT || 8787);
 const model = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const run = promisify(execFile);
+const lectureAudioJobs = new Map<string, Promise<Buffer>>();
+const lectureCacheMaxBytes = Number(process.env.LECTURE_CACHE_MAX_BYTES || 800 * 1024 * 1024);
 
 // Render terminates HTTPS at one reverse proxy. Trust exactly that hop so
 // express-rate-limit can safely identify the real client from X-Forwarded-For.
@@ -223,6 +225,15 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
   }).safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: "Некорректная тема лекции" });
   try {
+    const cacheKey = createHash("sha256").update(`lecture-audio-2026-07-29-v2\n${JSON.stringify(parsed.data)}`).digest("hex");
+    const cached = (await database.query<{ audio: Buffer; content_type: string }>("SELECT audio,content_type FROM lecture_audio WHERE cache_key=$1", [cacheKey])).rows[0];
+    if (cached) {
+      await database.query("UPDATE lecture_audio SET last_accessed_at=CURRENT_TIMESTAMP WHERE cache_key=$1", [cacheKey]);
+      response.setHeader("Content-Type", cached.content_type); response.setHeader("Content-Length", String(cached.audio.length)); response.setHeader("X-Lecture-Cache", "HIT"); response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+      return response.send(cached.audio);
+    }
+    const existingJob = lectureAudioJobs.get(cacheKey);
+    const audioJob = existingJob || (async () => {
     const isSection = parsed.data.mode === "section";
     const source = isSection
       ? `РАЗДЕЛ: ${parsed.data.title}\n\nВОПРОСЫ, КОТОРЫЕ НУЖНО СВЯЗНО РАСКРЫТЬ:\n${(parsed.data.topics || []).map((topic, index) => `${index + 1}. ${topic}`).join("\n")}`
@@ -244,14 +255,35 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
       response_format: "mp3"
     });
     const audio = Buffer.from(await speech.arrayBuffer());
+      if (audio.length <= lectureCacheMaxBytes) {
+        const usage = Number((await database.query<{ total: string }>("SELECT COALESCE(SUM(byte_size),0)::text AS total FROM lecture_audio")).rows[0]?.total || 0);
+        let bytesToFree = usage + audio.length - lectureCacheMaxBytes;
+        if (bytesToFree > 0) {
+          const oldest = (await database.query<{ cache_key: string; byte_size: number }>("SELECT cache_key,byte_size FROM lecture_audio ORDER BY last_accessed_at ASC")).rows;
+          const remove: string[] = [];
+          for (const item of oldest) { if (bytesToFree <= 0) break; remove.push(item.cache_key); bytesToFree -= item.byte_size; }
+          if (remove.length) await database.query("DELETE FROM lecture_audio WHERE cache_key=ANY($1::text[])", [remove]);
+        }
+        await database.query("INSERT INTO lecture_audio(cache_key,audio,content_type,byte_size) VALUES($1,$2,'audio/mpeg',$3) ON CONFLICT(cache_key) DO UPDATE SET last_accessed_at=CURRENT_TIMESTAMP", [cacheKey, audio, audio.length]);
+      }
+      return audio;
+    })();
+    if (!existingJob) lectureAudioJobs.set(cacheKey, audioJob);
+    const audio = await audioJob.finally(() => { if (lectureAudioJobs.get(cacheKey) === audioJob) lectureAudioJobs.delete(cacheKey); });
     response.setHeader("Content-Type", "audio/mpeg");
     response.setHeader("Content-Length", String(audio.length));
+    response.setHeader("X-Lecture-Cache", existingJob ? "COALESCED" : "MISS");
     response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
     response.send(audio);
   } catch (error) {
     console.error(error);
     response.status(502).json({ error: "Не удалось подготовить аудиолекцию" });
   }
+});
+
+app.get("/api/lectures/cache-status", authRequired, async (_request, response) => {
+  const status = (await database.query<{ count: string; bytes: string }>("SELECT COUNT(*)::text AS count,COALESCE(SUM(byte_size),0)::text AS bytes FROM lecture_audio")).rows[0];
+  response.json({ tracks: Number(status?.count || 0), bytes: Number(status?.bytes || 0), maxBytes: lectureCacheMaxBytes });
 });
 
 app.post("/api/java/compile", authRequired, async (request, response) => {
