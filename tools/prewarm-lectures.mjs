@@ -20,6 +20,7 @@
  * Options:
  *   --base-url URL                  API origin (default: Render production URL)
  *   --mode questions|sections|all  Which tracks to process (default: all)
+ *   --take N                       Process only the first N selected tracks
  *   --max-new N                    Stop after N cache misses; cache hits do not count
  *   --dry-run                      Build and show the plan without logging in or sending requests
  *   --help                         Show usage
@@ -72,6 +73,7 @@ function usage() {
 Параметры:
   --base-url URL                  адрес приложения (по умолчанию ${DEFAULT_BASE_URL})
   --mode questions|sections|all  вопросы, части лекций или всё (по умолчанию all)
+  --take N                       обработать только первые N выбранных треков
   --max-new N                    остановиться после N новых MP3; готовые HIT не считаются
   --dry-run                      только показать план, без входа и запросов
   --help                         показать эту справку`;
@@ -86,6 +88,7 @@ function parseArguments(argv) {
   const options = {
     baseUrl: DEFAULT_BASE_URL,
     mode: "all",
+    take: Number.POSITIVE_INFINITY,
     maxNew: Number.POSITIVE_INFINITY,
     dryRun: false,
     help: false
@@ -131,6 +134,17 @@ function parseArguments(argv) {
       if (!Number.isSafeInteger(options.maxNew)) {
         throw new Error("--max-new слишком велик.");
       }
+      continue;
+    }
+
+    const inlineTake = valueAfterEquals(argument, "--take");
+    if (argument === "--take" || inlineTake !== null) {
+      const value = inlineTake ?? argv[++index];
+      if (value === undefined || !/^\d+$/.test(value)) {
+        throw new Error("--take должен быть целым неотрицательным числом.");
+      }
+      options.take = Number(value);
+      if (!Number.isSafeInteger(options.take)) throw new Error("--take слишком велик.");
       continue;
     }
 
@@ -422,16 +436,18 @@ async function main() {
   }
 
   const { questions, sections } = await loadTracks();
-  const selectedTracks = options.mode === "questions"
+  const allSelectedTracks = options.mode === "questions"
     ? questions
     : options.mode === "sections"
       ? sections
       : [...questions, ...sections];
+  const selectedTracks = allSelectedTracks.slice(0, options.take);
   const tracks = [...new Map(selectedTracks.map((track) => [JSON.stringify(track.payload), track])).values()];
 
   process.stdout.write(
     `Банк: ${questions.length} ответов на вопросы + ${sections.length} частей лекций. ` +
-    `Выбрано: ${selectedTracks.length}, уникальных запросов: ${tracks.length} (${options.mode}).\n`
+    `Выбрано: ${selectedTracks.length}/${allSelectedTracks.length}, ` +
+    `уникальных запросов: ${tracks.length} (${options.mode}).\n`
   );
 
   if (options.dryRun) {

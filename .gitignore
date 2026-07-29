@@ -10,3 +10,4 @@ rus.traineddata
 data/*.sqlite*
 *.pdf
 .DS_Store
+.lecture-backups/
