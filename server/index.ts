@@ -23,6 +23,8 @@ const run = promisify(execFile);
 const lectureAudioJobs = new Map<string, Promise<Buffer>>();
 const lectureCacheMaxBytes = Number(process.env.LECTURE_CACHE_MAX_BYTES || 800 * 1024 * 1024);
 const lectureAudioBitrate = process.env.LECTURE_AUDIO_BITRATE || "48k";
+const configuredLectureSpeechSpeed = Number(process.env.LECTURE_SPEECH_SPEED || 1.2);
+const lectureSpeechSpeed = Number.isFinite(configuredLectureSpeechSpeed) ? Math.min(4, Math.max(0.25, configuredLectureSpeechSpeed)) : 1.2;
 
 const compressLectureAudio = async (source: Buffer) => {
   if (!ffmpegPath) return source;
@@ -181,7 +183,7 @@ app.get("/api/status", (_request, response) => response.json({
   ai: Boolean(client),
   java: process.env.ENABLE_LOCAL_JAVA === "true",
   model: client ? model : null,
-  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath) },
+  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed },
   features: { lectureFollowUps: true, uniqueListeningProgress: true }
 }));
 
@@ -324,6 +326,7 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
       voice: "alloy",
       input: lecture.output_text,
       instructions: "Говори по-русски спокойно, ясно и доброжелательно, как преподаватель на лекции. Делай небольшие паузы между смысловыми частями.",
+      speed: lectureSpeechSpeed,
       response_format: "mp3"
     });
     const audio = await compressLectureAudio(Buffer.from(await speech.arrayBuffer()));
