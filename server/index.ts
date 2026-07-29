@@ -50,7 +50,9 @@ const compressLectureAudio = async (source: Buffer) => {
 // express-rate-limit can safely identify the real client from X-Forwarded-For.
 app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "40kb" }));
+// Progress includes saved reference answers and lecture follow-ups, so it can
+// legitimately grow beyond a few dozen kilobytes.
+app.use(express.json({ limit: "1mb" }));
 app.use("/api", rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: "draft-8" }));
 
 const sessionCookie = "zachetka_session=";
@@ -121,7 +123,27 @@ app.post("/api/auth/telegram", async (request, response) => {
 app.get("/api/auth/me", async (request, response) => { const user = await currentUser(request); response.json({ user: user ? publicUser(user) : null }); });
 app.post("/api/auth/logout", async (request, response) => { const token = cookieToken(request.headers.cookie); if (token) await database.query("DELETE FROM sessions WHERE token_hash=$1", [tokenHash(token)]); response.setHeader("Set-Cookie", "zachetka_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"); response.json({ ok: true }); });
 app.get("/api/progress", authRequired, async (_request, response) => { const row = (await database.query<{ payload: Record<string, unknown>; updated_at: string }>("SELECT payload,updated_at FROM progress WHERE user_id=$1", [response.locals.user.id])).rows[0]; response.json({ data: row?.payload || {}, updatedAt: row?.updated_at }); });
-app.put("/api/progress", authRequired, async (request, response) => { const parsed = z.record(z.string(), z.unknown()).safeParse(request.body); if (!parsed.success || JSON.stringify(parsed.data).length > 1_000_000) return response.status(400).json({ error: "Некорректный прогресс" }); await database.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, parsed.data]); response.json({ ok: true }); });
+app.put("/api/progress", authRequired, async (request, response) => {
+  const parsed = z.record(z.string(), z.unknown()).safeParse(request.body);
+  if (!parsed.success || JSON.stringify(parsed.data).length > 1_000_000) return response.status(400).json({ error: "Некорректный прогресс" });
+  const current = (await database.query<{ payload: Record<string, unknown> }>("SELECT payload FROM progress WHERE user_id=$1", [response.locals.user.id])).rows[0]?.payload || {};
+  const merged = { ...current, ...parsed.data };
+  // Follow-ups are append-only. Merge them by id so a second open device with
+  // an older snapshot cannot erase an answer saved from the phone.
+  const readFollowUps = (value: unknown) => {
+    try {
+      const result = typeof value === "string" ? JSON.parse(value) : value;
+      return Array.isArray(result) ? result.filter((item) => item && typeof item === "object" && typeof item.id === "string") : [];
+    } catch { return []; }
+  };
+  const followUps = [...readFollowUps(current["exam-lecture-followups"]), ...readFollowUps(parsed.data["exam-lecture-followups"])];
+  if (followUps.length) {
+    const unique = Array.from(new Map(followUps.map((item) => [item.id, item])).values()).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    merged["exam-lecture-followups"] = JSON.stringify(unique);
+  }
+  await database.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, merged]);
+  response.json({ ok: true });
+});
 
 const WrittenGrade = z.object({
   score: z.number().int().min(0).max(25),
@@ -159,7 +181,8 @@ app.get("/api/status", (_request, response) => response.json({
   ai: Boolean(client),
   java: process.env.ENABLE_LOCAL_JAVA === "true",
   model: client ? model : null,
-  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath) }
+  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath) },
+  features: { lectureFollowUps: true, uniqueListeningProgress: true }
 }));
 
 app.post("/api/grade/written", authRequired, async (request, response) => {
@@ -238,6 +261,30 @@ app.post("/api/reference-answer", authRequired, async (request, response) => {
   } catch (error) {
     console.error(error);
     response.status(502).json({ error: "Не удалось подготовить эталонный ответ" });
+  }
+});
+
+app.post("/api/lectures/follow-up", authRequired, async (request, response) => {
+  if (!client) return response.status(503).json({ error: "Уточняющие вопросы временно недоступны: OpenAI не настроен" });
+  const parsed = z.object({
+    originalQuestion: z.string().trim().min(5).max(3000),
+    followUp: z.string().trim().min(3).max(2000)
+  }).safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: "Некорректный исходный или уточняющий вопрос" });
+  try {
+    const result = await client.responses.create({
+      model,
+      reasoning: { effort: "low" },
+      max_output_tokens: 600,
+      instructions: `Ответь по-русски точно, понятно и строго в контексте исходного экзаменационного вопроса. Отвечай только на заданное уточнение и не повторяй весь основной ответ. Если уточнение двусмысленно, кратко обозначь принятое допущение. Используй короткие абзацы; не используй markdown-таблицы.`,
+      input: `ИСХОДНЫЙ ЭКЗАМЕНАЦИОННЫЙ ВОПРОС:\n${parsed.data.originalQuestion}\n\nУТОЧНЯЮЩИЙ ВОПРОС:\n${parsed.data.followUp}`
+    });
+    const answer = result.output_text.trim();
+    if (!answer) throw new Error("OpenAI вернул пустой ответ на уточняющий вопрос");
+    response.json({ answer });
+  } catch (error) {
+    console.error(error);
+    response.status(502).json({ error: "Не удалось получить ответ на уточняющий вопрос" });
   }
 });
 

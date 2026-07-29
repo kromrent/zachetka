@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { codeTasks, demoQuestions, subjects, writtenQuestions, type Question, type Subject } from "./data";
 import questionBankData from "./question-bank.json";
+import { addListenedRange, migrateLegacyRanges, totalUniqueSeconds, type ListeningRange } from "./listening-progress";
 
 type Bank = { id: string; title: string; sections: { title: string; questions: string[] }[]; tasks: string[] };
 const questionBanks = questionBankData as Bank[];
 type SavedReference = { id: string; subject: string; section: string; question: string; answer: string; keyPoints: string[]; savedAt: string };
 type TaskProgress = { id: string; task: string; code: string; score: number; level: string; completed: boolean; updatedAt: string };
-type LectureProgress = { id: string; subject: string; section: string; title: string; listenedSeconds: number; positionSeconds?: number; duration: number; percent: number; completed: boolean; updatedAt: string };
+type LectureProgress = { id: string; subject: string; section: string; title: string; listenedSeconds: number; listenedRanges?: ListeningRange[]; positionSeconds?: number; duration: number; percent: number; completed: boolean; updatedAt: string };
+type LectureFollowUp = { id: string; trackId: string; subject: string; section: string; originalQuestion: string; question: string; answer: string; createdAt: string };
 type AccountUser = { id: number; username: string | null; displayName: string; telegram: boolean };
 const readStore = <T,>(key: string, fallback: T): T => { try { return JSON.parse(localStorage.getItem(key) || "") as T; } catch { return fallback; } };
 const saveReference = (item: SavedReference) => { const current = readStore<Record<string, SavedReference>>("exam-reference-answers", {}); current[item.id] = item; localStorage.setItem("exam-reference-answers", JSON.stringify(current)); };
@@ -104,8 +106,9 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const [subjectId, setSubjectId] = useState("all"); const [sectionId, setSectionId] = useState("all");
   const [index, setIndex] = useState(() => Number(localStorage.getItem("exam-lecture-index") || 0));
   const [audioUrl, setAudioUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [speed, setSpeed] = useState(1);
+  const [repeatCurrent, setRepeatCurrent] = useState(() => localStorage.getItem("exam-lecture-repeat") === "true");
   const [listeningProgress, setListeningProgress] = useState<Record<string, LectureProgress>>(() => readStore("exam-lecture-progress", {}));
-  const audioRef = useRef<HTMLAudioElement>(null); const urlRef = useRef(""); const lastProgressWrite = useRef(0); const lastMediaTime = useRef(0); const pendingListened = useRef(0);
+  const audioRef = useRef<HTMLAudioElement>(null); const urlRef = useRef(""); const loadedTrackRef = useRef<LectureTrack | null>(null); const loadVersionRef = useRef(0); const recordListeningRef = useRef<(force?: boolean) => void>(() => undefined); const lastProgressWrite = useRef(0); const lastMediaTime = useRef(0); const pendingRanges = useRef<ListeningRange[]>([]); const seeking = useRef(false);
   const sections = subjectId === "all" ? [] : questionBanks.find((bank) => bank.id === subjectId)?.sections || [];
   const tracks = useMemo<LectureTrack[]>(() => {
     const banks = questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId);
@@ -138,8 +141,8 @@ function Lectures({ onBack }: { onBack: () => void }) {
   }, [lectureMode, subjectId, sectionId]);
   const sectionCount = new Set(tracks.map((track) => track.sectionKey)).size;
   const currentIndex = tracks.length ? index % tracks.length : 0; const current = tracks[currentIndex];
-  useEffect(() => { setIndex(0); setAudioUrl(""); setError(""); if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = ""; } }, [lectureMode, subjectId, sectionId]);
-  useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
+  useEffect(() => { loadVersionRef.current += 1; recordListeningRef.current(true); audioRef.current?.pause(); loadedTrackRef.current = null; pendingRanges.current = []; setIndex(0); setAudioUrl(""); setLoading(false); setError(""); if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = ""; } }, [lectureMode, subjectId, sectionId]);
+  useEffect(() => () => { loadVersionRef.current += 1; recordListeningRef.current(true); if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
   const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
   const cacheLocation = (track: LectureTrack) => {
     const version = "v4";
@@ -152,48 +155,121 @@ function Lectures({ onBack }: { onBack: () => void }) {
     if (response.ok) await cache.put(cacheKey, response);
   };
   const load = async (nextIndex = currentIndex, autoplay = true) => {
-    const track = tracks[nextIndex]; if (!track) return; setLoading(true); setError("");
+    const track = tracks[nextIndex]; if (!track) return; const loadVersion = ++loadVersionRef.current; setLoading(true); setError("");
     try {
       const { cacheName, cacheKey } = cacheLocation(track); const cache = "caches" in window ? await caches.open(cacheName) : null;
       let audioResponse = cache ? await cache.match(cacheKey) : undefined;
       if (!audioResponse) { const response = await fetch("/api/lectures/audio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)) }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "Аудио недоступно"); } audioResponse = response; if (cache) await cache.put(cacheKey, response.clone()); }
-      const blob = await audioResponse.blob(); if (urlRef.current) URL.revokeObjectURL(urlRef.current); const url = URL.createObjectURL(blob); urlRef.current = url; lastMediaTime.current = 0; pendingListened.current = 0; setIndex(nextIndex); setAudioUrl(url); localStorage.setItem("exam-lecture-index", String(nextIndex));
+      const blob = await audioResponse.blob(); if (loadVersion !== loadVersionRef.current) return; audioRef.current?.pause(); recordListeningRef.current(true); if (urlRef.current) URL.revokeObjectURL(urlRef.current); const url = URL.createObjectURL(blob); urlRef.current = url; loadedTrackRef.current = track; lastMediaTime.current = 0; pendingRanges.current = []; seeking.current = false; lastProgressWrite.current = 0; setIndex(nextIndex); setAudioUrl(url); localStorage.setItem("exam-lecture-index", String(nextIndex));
       if ("mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: track.title, artist: track.section, album: track.subject });
-      if (autoplay) window.setTimeout(() => audioRef.current?.play().catch(() => null), 50);
-    } catch (e: any) { setError(e.message || "Не удалось загрузить лекцию"); } finally { setLoading(false); }
+      if (autoplay) window.setTimeout(() => { if (loadVersion === loadVersionRef.current) audioRef.current?.play().catch(() => null); }, 50);
+    } catch (e: any) { if (loadVersion === loadVersionRef.current) setError(e.message || "Не удалось загрузить лекцию"); } finally { if (loadVersion === loadVersionRef.current) setLoading(false); }
   };
   const recordListening = (force = false) => {
-    const audio = audioRef.current; if (!audio || !current || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
-    const delta = audio.currentTime - lastMediaTime.current; if (!audio.paused && delta > 0 && delta < 10) pendingListened.current += delta; lastMediaTime.current = audio.currentTime;
-    const saved = readStore<Record<string, LectureProgress>>("exam-lecture-progress", {}); const previous = saved[current.id];
-    const listenedSeconds = Math.min(audio.duration, (previous?.listenedSeconds || 0) + pendingListened.current); const percent = Math.min(100, listenedSeconds / audio.duration * 100); const completed = Boolean(previous?.completed || percent >= 50);
+    const audio = audioRef.current; const track = loadedTrackRef.current; if (!audio || !track || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+    const rangeStart = lastMediaTime.current; const rangeEnd = audio.currentTime;
+    if (!seeking.current && rangeEnd > rangeStart) pendingRanges.current = addListenedRange(pendingRanges.current, rangeStart, rangeEnd, audio.duration);
+    else if (!seeking.current && audio.loop && rangeStart > audio.duration - 2 && rangeEnd < 2) {
+      pendingRanges.current = addListenedRange(pendingRanges.current, rangeStart, audio.duration, audio.duration);
+      pendingRanges.current = addListenedRange(pendingRanges.current, 0, rangeEnd, audio.duration);
+    }
+    lastMediaTime.current = rangeEnd;
+    const saved = readStore<Record<string, LectureProgress>>("exam-lecture-progress", {}); const previous = saved[track.id];
+    let listenedRanges = migrateLegacyRanges(previous || {}, audio.duration);
+    for (const [start, end] of pendingRanges.current) listenedRanges = addListenedRange(listenedRanges, start, end, audio.duration);
+    const listenedSeconds = totalUniqueSeconds(listenedRanges, audio.duration); const percent = Math.min(100, listenedSeconds / audio.duration * 100); const completed = percent >= 50;
     const justCompleted = completed && !previous?.completed; if (!force && !justCompleted && Date.now() - lastProgressWrite.current < 5000) return;
-    lastProgressWrite.current = Date.now(); pendingListened.current = 0;
-    const item: LectureProgress = { id: current.id, subject: current.subject, section: current.section, title: current.title, listenedSeconds, positionSeconds: audio.currentTime, duration: audio.duration, percent, completed, updatedAt: new Date().toISOString() };
-    const next = { ...saved, [current.id]: item }; localStorage.setItem("exam-lecture-progress", JSON.stringify(next)); setListeningProgress(next);
+    lastProgressWrite.current = Date.now(); pendingRanges.current = [];
+    const item: LectureProgress = { id: track.id, subject: track.subject, section: track.section, title: track.title, listenedSeconds, listenedRanges, positionSeconds: audio.currentTime, duration: audio.duration, percent, completed, updatedAt: new Date().toISOString() };
+    const next = { ...saved, [track.id]: item }; localStorage.setItem("exam-lecture-progress", JSON.stringify(next)); setListeningProgress(next);
   };
+  recordListeningRef.current = recordListening;
   const move = (delta: number) => { if (!tracks.length) return; recordListening(true); load((currentIndex + delta + tracks.length) % tracks.length); };
+  const toggleRepeat = () => setRepeatCurrent((enabled) => {
+    const next = !enabled;
+    localStorage.setItem("exam-lecture-repeat", String(next));
+    return next;
+  });
+  useEffect(() => {
+    const flush = () => recordListeningRef.current(true);
+    const flushWhenHidden = () => { if (document.hidden) flush(); };
+    window.addEventListener("pagehide", flush); document.addEventListener("visibilitychange", flushWhenHidden);
+    return () => { window.removeEventListener("pagehide", flush); document.removeEventListener("visibilitychange", flushWhenHidden); };
+  }, []);
   useEffect(() => { if (!("mediaSession" in navigator)) return; navigator.mediaSession.setActionHandler("nexttrack", () => move(1)); navigator.mediaSession.setActionHandler("previoustrack", () => move(-1)); return () => { navigator.mediaSession.setActionHandler("nexttrack", null); navigator.mediaSession.setActionHandler("previoustrack", null); }; });
   const currentProgress = current ? listeningProgress[current.id] : null;
   return <section className="lectures-page">
-    <button className="back" onClick={onBack}>← На главную</button>
+    <button className="back" onClick={() => { loadVersionRef.current += 1; recordListening(true); onBack(); }}>← На главную</button>
     <div className="lecture-head"><div><p className="eyebrow">Фоновое обучение</p><h1>Лекции</h1><p>Слушай отдельные вопросы подряд или одну цельную лекцию по всему разделу.</p></div><span>♫</span></div>
     <div className="lecture-mode-tabs">
-      <button className={lectureMode === "questions" ? "active" : ""} onClick={() => setLectureMode("questions")}><strong>Все вопросы</strong><small>каждый вопрос — отдельный трек</small></button>
-      <button className={lectureMode === "sections" ? "active" : ""} onClick={() => setLectureMode("sections")}><strong>По разделам</strong><small>полноценная связная лекция</small></button>
+      <button className={lectureMode === "questions" ? "active" : ""} onClick={() => { if (lectureMode !== "questions") { loadVersionRef.current += 1; setLectureMode("questions"); } }}><strong>Все вопросы</strong><small>каждый вопрос — отдельный трек</small></button>
+      <button className={lectureMode === "sections" ? "active" : ""} onClick={() => { if (lectureMode !== "sections") { loadVersionRef.current += 1; setLectureMode("sections"); } }}><strong>По разделам</strong><small>полноценная связная лекция</small></button>
     </div>
     <div className="lecture-filters">
-      <label>Предмет<select value={subjectId} onChange={(e) => { setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
-      <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => setSectionId(e.target.value)}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
+      <label>Предмет<select value={subjectId} onChange={(e) => { loadVersionRef.current += 1; setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
+      <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => { loadVersionRef.current += 1; setSectionId(e.target.value); }}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
     </div>
     {current && <div className="lecture-player">
       <div className="lecture-number">{currentIndex + 1} / {tracks.length}</div><small>{current.subject} · {current.section}</small><h2>{current.title}</h2>
       {current.mode === "section" && <p className="lecture-coverage">Часть {current.part} из {current.partCount} · {current.topics?.length || 0} полных ответа · части включаются автоматически</p>}
       {currentProgress && <p className={`lecture-listened ${currentProgress.completed ? "completed" : ""}`}>{currentProgress.completed ? "✓ Засчитано" : `Прослушано ${Math.round(currentProgress.percent)}%`} · засчитывается после 50%</p>}
-      {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : currentProgress?.completed ? "▶ Прослушать ещё раз" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline onPlay={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null); }} onSeeking={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; }} onTimeUpdate={() => recordListening()} onPause={() => recordListening(true)} onEnded={() => { recordListening(true); move(1); }} onLoadedMetadata={() => { if (!audioRef.current) return; audioRef.current.playbackRate = speed; const saved = readStore<Record<string, LectureProgress>>("exam-lecture-progress", {})[current.id]; const position = saved?.positionSeconds ?? 0; if (saved && !saved.completed && position > 0 && position < audioRef.current.duration * .95) audioRef.current.currentTime = position; lastMediaTime.current = audioRef.current.currentTime; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button onClick={() => move(1)}>Следующая →</button></div></>}
+      {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : currentProgress?.completed ? "▶ Прослушать ещё раз" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline loop={repeatCurrent} onPlay={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null); }} onSeeking={() => { seeking.current = true; if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; }} onSeeked={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; seeking.current = false; }} onTimeUpdate={() => recordListening()} onPause={() => recordListening(true)} onEnded={() => { recordListening(true); if (!repeatCurrent) move(1); }} onLoadedMetadata={() => { if (!audioRef.current) return; audioRef.current.playbackRate = speed; const loadedTrack = loadedTrackRef.current; const saved = loadedTrack ? readStore<Record<string, LectureProgress>>("exam-lecture-progress", {})[loadedTrack.id] : null; const position = saved?.positionSeconds ?? 0; if (saved && !saved.completed && position > 0 && position < audioRef.current.duration * .95) audioRef.current.currentTime = position; lastMediaTime.current = audioRef.current.currentTime; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button className={repeatCurrent ? "active" : ""} aria-pressed={repeatCurrent} onClick={toggleRepeat}>↻ {repeatCurrent ? "Повтор включён" : "На повтор"}</button><button onClick={() => move(1)}>Следующая →</button></div></>}
       {loading && audioUrl && <p className="lecture-loading">Готовлю следующий трек…</p>}{error && <p className="inline-error">{error}</p>}
     </div>}
+    {current && <LectureFollowUps track={current}/>}
     <div className="lecture-queue"><div className="section-title"><h2>{lectureMode === "questions" ? "Все вопросы" : "Полные лекции по разделам"}</h2><span>{lectureMode === "questions" ? `${tracks.length} вопросов` : `${sectionCount} разделов · ${tracks.length} частей`}</span></div><div className="lecture-queue-list">{tracks.map((track, trackIndex) => { const progress = listeningProgress[track.id]; return <button className={`${trackIndex === currentIndex ? "active " : ""}${progress?.completed ? "listened" : ""}`} key={track.id} onClick={() => { recordListening(true); load(trackIndex); }}><span>{progress?.completed ? "✓" : trackIndex + 1}</span><div><small>{track.subject} · {track.section}</small><strong>{track.title}</strong>{track.mode === "section" && <em>{track.topics?.length || 0} вопроса: сначала формулировка, затем полный ответ</em>}{progress && !progress.completed && <em>Прослушано {Math.round(progress.percent)}%</em>}</div></button>; })}</div></div>
+  </section>;
+}
+
+function LectureFollowUps({ track }: { track: LectureTrack }) {
+  const storageKey = "exam-lecture-followups";
+  const [items, setItems] = useState<LectureFollowUp[]>(() => readStore(storageKey, []));
+  const [topicIndex, setTopicIndex] = useState(0);
+  const [question, setQuestion] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const requestRef = useRef<AbortController | null>(null);
+  useEffect(() => { requestRef.current?.abort(); requestRef.current = null; setTopicIndex(0); setQuestion(""); setError(""); setLoading(false); }, [track.id]);
+  useEffect(() => () => requestRef.current?.abort(), []);
+  const topics = track.topics || [];
+  const originalQuestion = track.mode === "section" ? topics[Math.min(topicIndex, Math.max(0, topics.length - 1))] || track.title : track.title;
+  const currentItems = items.filter((item) => item.trackId === track.id);
+  const ask = async () => {
+    const followUp = question.trim();
+    if (followUp.length < 3) return;
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setLoading(true); setError("");
+    try {
+      const response = await fetch("/api/lectures/follow-up", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ originalQuestion, followUp }), signal: controller.signal });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Не удалось получить ответ");
+      if (controller.signal.aborted) return;
+      const item: LectureFollowUp = {
+        id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        trackId: track.id,
+        subject: track.subject,
+        section: track.section,
+        originalQuestion,
+        question: followUp,
+        answer: body.answer,
+        createdAt: new Date().toISOString()
+      };
+      const next = [item, ...items];
+      setItems(next); localStorage.setItem(storageKey, JSON.stringify(next)); setQuestion(""); syncProgress();
+    } catch (e: any) { if (e?.name !== "AbortError" && requestRef.current === controller) setError(e.message || "Уточнение сейчас недоступно"); } finally { if (requestRef.current === controller) { requestRef.current = null; setLoading(false); } }
+  };
+  return <section className="lecture-followups">
+    <p className="eyebrow">Разобраться глубже</p><h3>Задать уточнение к вопросу</h3>
+    {track.mode === "section" && topics.length > 0 && <label className="followup-topic">К какому вопросу<select value={topicIndex} onChange={(event) => setTopicIndex(Number(event.target.value))}>{topics.map((topic, index) => <option value={index} key={`${track.id}-${index}`}>{index + 1}. {topic}</option>)}</select></label>}
+    <div className="followup-context"><span>Исходный вопрос</span><strong>{originalQuestion}</strong></div>
+    <textarea value={question} disabled={loading} onChange={(event) => setQuestion(event.target.value)} placeholder="Например: чем это отличается от переопределения?" maxLength={2000}/>
+    {error && <p className="inline-error">{error}</p>}
+    <button className="followup-submit" disabled={loading || question.trim().length < 3} onClick={ask}>{loading ? "Ищу точный ответ…" : "Получить текстовый ответ"}</button>
+    <small className="followup-note">Ответ сохранится в аккаунте и останется доступен позже. Аудио для уточнений не создаётся.</small>
+    {currentItems.length > 0 && <div className="followup-current"><h4>Уточнения к этому треку</h4>{currentItems.map((item) => <article className="followup-card" key={item.id}><small>{item.originalQuestion}</small><strong>Ты: {item.question}</strong><p>{item.answer}</p><time>{new Date(item.createdAt).toLocaleString("ru-RU")}</time></article>)}</div>}
+    {items.length > 0 && <details className="saved-followups"><summary>Все сохранённые уточнения ({items.length})</summary><div>{items.map((item) => <article className="followup-card" key={`saved-${item.id}`}><small>{item.subject} · {item.section}</small><strong>{item.question}</strong><p>{item.answer}</p><time>{new Date(item.createdAt).toLocaleString("ru-RU")}</time></article>)}</div></details>}
   </section>;
 }
 
