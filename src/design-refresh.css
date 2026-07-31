@@ -352,6 +352,7 @@ summary {
 }
 
 .lecture-text-toggle > b {
+  position: relative;
   display: grid;
   width: 34px;
   height: 34px;
@@ -360,9 +361,29 @@ summary {
   border: 1px solid #777b84;
   border-radius: 50%;
   color: var(--lime);
-  font-size: 22px;
+  font-size: 0;
   font-weight: 500;
-  line-height: 1;
+}
+
+.lecture-text-toggle > b::before,
+.lecture-text-toggle > b::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+  content: "";
+  transform: translate(-50%, -50%);
+}
+
+.lecture-text-toggle[aria-expanded="false"] > b::after {
+  transform: translate(-50%, -50%) rotate(90deg);
+}
+
+.lecture-text-toggle[aria-expanded="true"] > b::after {
+  display: none;
 }
 
 .lecture-text-toggle[aria-expanded="true"] {
