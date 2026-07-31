@@ -43,6 +43,14 @@ export const databaseReady = database.query(`
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS question_quiz (
+    cache_key TEXT PRIMARY KEY,
+    question_key TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS question_quiz_question_key_idx ON question_quiz(question_key);
 `).then(() => undefined);
 
 export type DbUser = { id: number; username: string | null; telegram_id: string | null; display_name: string };

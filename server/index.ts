@@ -18,6 +18,7 @@ try { process.loadEnvFile?.(); } catch { /* .env is optional until AI is configu
 const app = express();
 const port = Number(process.env.PORT || 8787);
 const model = process.env.OPENAI_MODEL || "gpt-5.6-luna";
+const quizModel = process.env.OPENAI_QUIZ_MODEL || model;
 const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const run = promisify(execFile);
 const lectureAudioJobs = new Map<string, Promise<Buffer>>();
@@ -27,6 +28,26 @@ const lectureTranscribeModel = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mi
 const lectureSpeechChunkMaxCharacters = 4000;
 const configuredLectureSpeechSpeed = Number(process.env.LECTURE_SPEECH_SPEED || 1.2);
 const lectureSpeechSpeed = Number.isFinite(configuredLectureSpeechSpeed) ? Math.min(4, Math.max(0.25, configuredLectureSpeechSpeed)) : 1.2;
+const questionQuizCacheVersion = "question-mini-quiz-2026-07-31-v1";
+
+const QuestionBank = z.array(z.object({
+  id: z.string().trim().min(1).max(64).regex(/^[a-z0-9_-]+$/),
+  title: z.string().trim().min(2).max(500),
+  sections: z.array(z.object({
+    title: z.string().trim().min(2).max(500),
+    questions: z.array(z.string().trim().min(5).max(5000)).min(1)
+  })).min(1)
+})).min(1);
+
+// Mini quizzes only accept canonical question keys. Loading the committed bank
+// on the server keeps clients from submitting arbitrary prompts and bounds the
+// number of possible paid cache misses to the real exam questions.
+const questionBanks = QuestionBank.parse(JSON.parse(
+  await readFile(new URL("../src/question-bank.json", import.meta.url), "utf8")
+));
+if (new Set(questionBanks.map((bank) => bank.id)).size !== questionBanks.length) {
+  throw new Error("question-bank.json contains duplicate subject ids");
+}
 
 const splitLectureTextForSpeech = (text: string, maxCharacters = lectureSpeechChunkMaxCharacters) => {
   const chunks: string[] = [];
@@ -209,6 +230,44 @@ app.put("/api/progress", authRequired, async (request, response) => {
     }
     if (Object.keys(questionNotes).length) merged["exam-question-notes"] = JSON.stringify(questionNotes);
 
+    // Mini-test results are personal, but the best score must never move
+    // backwards when two devices finish attempts from different snapshots.
+    const readQuestionQuizProgress = (value: unknown) => {
+      try {
+        const result = typeof value === "string" ? JSON.parse(value) : value;
+        if (!result || typeof result !== "object" || Array.isArray(result)) return {} as Record<string, Record<string, unknown>>;
+        return Object.fromEntries(Object.entries(result).filter(([questionKey, item]) => {
+          if (!/^[a-z0-9_-]+:\d+-\d+$/.test(questionKey) || !item || typeof item !== "object" || Array.isArray(item)) return false;
+          const progress = item as Record<string, unknown>;
+          return typeof progress.bestScore === "number"
+            && typeof progress.lastScore === "number"
+            && typeof progress.attempts === "number"
+            && typeof progress.updatedAt === "string";
+        })) as Record<string, Record<string, unknown>>;
+      } catch { return {} as Record<string, Record<string, unknown>>; }
+    };
+    const questionQuizProgress = readQuestionQuizProgress(current["exam-question-quiz-progress"]);
+    for (const [questionKey, candidate] of Object.entries(readQuestionQuizProgress(parsed.data["exam-question-quiz-progress"]))) {
+      const saved = questionQuizProgress[questionKey];
+      const savedAt = Date.parse(String(saved?.updatedAt || "")) || 0;
+      const candidateAt = Date.parse(String(candidate.updatedAt || "")) || 0;
+      const newest = !saved || candidateAt >= savedAt ? candidate : saved;
+      const score = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(8, Math.floor(value))) : 0;
+      const bestScore = Math.max(score(saved?.bestScore), score(candidate.bestScore), score(newest.lastScore));
+      const attempts = Math.max(
+        typeof saved?.attempts === "number" && Number.isFinite(saved.attempts) ? Math.max(0, Math.floor(saved.attempts)) : 0,
+        typeof candidate.attempts === "number" && Number.isFinite(candidate.attempts) ? Math.max(0, Math.floor(candidate.attempts)) : 0
+      );
+      questionQuizProgress[questionKey] = {
+        bestScore,
+        lastScore: score(newest.lastScore),
+        attempts,
+        mastered: Boolean(saved?.mastered) || Boolean(candidate.mastered) || bestScore >= 6,
+        updatedAt: String(newest.updatedAt || "")
+      };
+    }
+    if (Object.keys(questionQuizProgress).length) merged["exam-question-quiz-progress"] = JSON.stringify(questionQuizProgress);
+
     await connection.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, merged]);
     await connection.query("COMMIT");
     response.json({ ok: true });
@@ -245,6 +304,107 @@ const GeneratedQuiz = z.object({ questions: z.array(z.object({
   answer: z.number().int().min(0).max(3),
   explanation: z.string()
 })).length(8) });
+
+const QuestionQuiz = z.object({ questions: z.array(z.object({
+  text: z.string().min(10).max(500),
+  options: z.array(z.string().min(1).max(300)).length(4),
+  answer: z.number().int().min(0).max(3),
+  explanation: z.string().min(5).max(800)
+})).length(8) });
+type QuestionQuizPayload = z.infer<typeof QuestionQuiz>;
+type CanonicalQuestion = {
+  questionKey: string;
+  subjectTitle: string;
+  sectionTitle: string;
+  question: string;
+};
+
+const QuestionQuizInput = z.object({
+  questionKey: z.string().trim().min(5).max(100)
+}).strict();
+
+const resolveCanonicalQuestion = (questionKey: string): CanonicalQuestion | null => {
+  const match = /^([a-z0-9_-]+):(\d+)-(\d+)$/.exec(questionKey);
+  if (!match) return null;
+  const bank = questionBanks.find((item) => item.id === match[1]);
+  const sectionIndex = Number(match[2]);
+  const questionIndex = Number(match[3]);
+  if (!bank || !Number.isSafeInteger(sectionIndex) || !Number.isSafeInteger(questionIndex)) return null;
+  if (questionKey !== `${bank.id}:${sectionIndex}-${questionIndex}`) return null;
+  const section = bank.sections[sectionIndex];
+  const question = section?.questions[questionIndex];
+  if (!section || !question) return null;
+  return { questionKey, subjectTitle: bank.title, sectionTitle: section.title, question };
+};
+
+const quizComparisonKey = (value: string) => value.trim().replace(/\s+/gu, " ").normalize("NFKC").toLocaleLowerCase("ru-RU");
+const validateQuestionQuiz = (value: unknown): QuestionQuizPayload | null => {
+  const parsed = QuestionQuiz.safeParse(value);
+  if (!parsed.success) return null;
+  const questions = parsed.data.questions.map((item) => ({
+    ...item,
+    text: item.text.trim(),
+    options: item.options.map((option) => option.trim()),
+    explanation: item.explanation.trim()
+  }));
+  if (questions.some((item) => item.text.length < 10 || item.explanation.length < 5 || item.options.some((option) => !option))) return null;
+  if (new Set(questions.map((item) => quizComparisonKey(item.text))).size !== questions.length) return null;
+  if (questions.some((item) => new Set(item.options.map(quizComparisonKey)).size !== item.options.length)) return null;
+  return { questions };
+};
+
+const questionQuizCacheKeyFor = (input: CanonicalQuestion) => createHash("sha256")
+  .update(`${questionQuizCacheVersion}\n${JSON.stringify(input)}`)
+  .digest("hex");
+
+const questionQuizJobs = new Map<string, Promise<QuestionQuizPayload>>();
+
+const readQuestionQuiz = async (cacheKey: string): Promise<QuestionQuizPayload | null> => {
+  const row = (await database.query<{ payload: unknown }>(
+    "SELECT payload FROM question_quiz WHERE cache_key=$1",
+    [cacheKey]
+  )).rows[0];
+  if (!row) return null;
+  const payload = validateQuestionQuiz(row.payload);
+  if (!payload) {
+    console.error(`Некорректная запись question_quiz для cache_key=${cacheKey}`);
+    return null;
+  }
+  await database.query("UPDATE question_quiz SET last_accessed_at=CURRENT_TIMESTAMP WHERE cache_key=$1", [cacheKey]);
+  return payload;
+};
+
+const saveQuestionQuiz = async (cacheKey: string, questionKey: string, payload: QuestionQuizPayload): Promise<QuestionQuizPayload> => {
+  const row = (await database.query<{ payload: unknown }>(
+    `INSERT INTO question_quiz(cache_key,question_key,payload)
+     VALUES($1,$2,$3)
+     ON CONFLICT(cache_key) DO UPDATE SET last_accessed_at=CURRENT_TIMESTAMP
+     RETURNING payload`,
+    [cacheKey, questionKey, payload]
+  )).rows[0];
+  const persisted = validateQuestionQuiz(row?.payload);
+  if (persisted) return persisted;
+  // A malformed row should never be created by this version, but repairing it
+  // avoids paying for the same valid generation again after every request.
+  await database.query(
+    "UPDATE question_quiz SET question_key=$2,payload=$3,last_accessed_at=CURRENT_TIMESTAMP WHERE cache_key=$1",
+    [cacheKey, questionKey, payload]
+  );
+  return payload;
+};
+
+const generateQuestionQuiz = async (input: CanonicalQuestion, cacheKey: string, ai: OpenAI): Promise<QuestionQuizPayload> => {
+  const result = await ai.responses.parse({
+    model: quizModel,
+    max_output_tokens: 2500,
+    instructions: `Создай мини-тест ровно из 8 неповторяющихся вопросов по одному теоретическому вопросу вступительного экзамена. Каждый вопрос теста должен проверять отдельный существенный аспект исходной темы: определения, связи или классификации, принципы работы, применение и типичные заблуждения. Не выходи за границы исходной формулировки и не спрашивай сведения, зависящие от версии продукта. Для каждого вопроса дай ровно четыре коротких правдоподобных варианта и только один бесспорно правильный ответ. Не повторяй варианты внутри одного вопроса. Распределяй позиции правильных ответов, не ставь их всегда под одним номером. Объяснение правильного ответа — 1–2 точных предложения по-русски.`,
+    input: `ПРЕДМЕТ: ${input.subjectTitle}\nРАЗДЕЛ: ${input.sectionTitle}\nИСХОДНЫЙ ЭКЗАМЕНАЦИОННЫЙ ВОПРОС:\n${input.question}`,
+    text: { format: zodTextFormat(QuestionQuiz, "question_quiz") }
+  });
+  const payload = validateQuestionQuiz(result.output_parsed);
+  if (!payload) throw Object.assign(new Error("OpenAI вернул повторяющийся или некорректный мини-тест"), { code: "invalid_question_quiz" });
+  return saveQuestionQuiz(cacheKey, input.questionKey, payload);
+};
 
 const ReferenceAnswer = z.object({
   answer: z.string(),
@@ -357,9 +517,10 @@ app.get("/api/status", (_request, response) => response.json({
   ai: Boolean(client),
   java: process.env.ENABLE_LOCAL_JAVA === "true",
   model: client ? model : null,
+  questionQuiz: { model: client ? quizModel : null, questionsPerTopic: 8, cache: "postgresql" },
   lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed, maxCharactersPerPart: lectureSpeechChunkMaxCharacters },
   lectureText: { transcriptionModel: lectureTranscribeModel },
-  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true, questionNotes: true, writtenRetry: true }
+  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true, questionNotes: true, writtenRetry: true, questionQuiz: true }
 }));
 
 app.post("/api/grade/written", authRequired, async (request, response) => {
@@ -419,6 +580,45 @@ app.post("/api/quiz/generate", authRequired, async (request, response) => {
   } catch (error) {
     console.error(error);
     response.status(502).json({ error: "Не удалось создать новый тест" });
+  }
+});
+
+app.post("/api/question-quiz", authRequired, async (request, response) => {
+  const parsed = QuestionQuizInput.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: "Нужен корректный ключ вопроса" });
+  const canonical = resolveCanonicalQuestion(parsed.data.questionKey);
+  if (!canonical) return response.status(404).json({ error: "Вопрос не найден в экзаменационной программе" });
+  const cacheKey = questionQuizCacheKeyFor(canonical);
+  try {
+    const cached = await readQuestionQuiz(cacheKey);
+    if (cached) {
+      response.setHeader("X-Question-Quiz-Cache", "HIT");
+      return response.json({ questionKey: canonical.questionKey, ...cached });
+    }
+
+    // Ready cache entries remain usable even if the API key or balance is no
+    // longer available. OpenAI is checked only after the PostgreSQL lookup.
+    const ai = client;
+    if (!ai) return response.status(503).json({ error: "Этот тест ещё не сохранён, а OpenAI не настроен" });
+
+    const existingJob = questionQuizJobs.get(cacheKey);
+    const quizJob = existingJob || generateQuestionQuiz(canonical, cacheKey, ai);
+    if (!existingJob) questionQuizJobs.set(cacheKey, quizJob);
+    try {
+      const payload = await quizJob;
+      response.setHeader("X-Question-Quiz-Cache", existingJob ? "COALESCED" : "MISS");
+      response.json({ questionKey: canonical.questionKey, ...payload });
+    } finally {
+      if (questionQuizJobs.get(cacheKey) === quizJob) questionQuizJobs.delete(cacheKey);
+    }
+  } catch (error) {
+    console.error(error);
+    const code = (error as { code?: string; error?: { code?: string } })?.code
+      || (error as { error?: { code?: string } })?.error?.code;
+    if (code === "insufficient_quota") {
+      return response.status(402).json({ error: "Баланс OpenAI закончился; уже готовые тесты сохранены" });
+    }
+    response.status(502).json({ error: "Не удалось подготовить мини-тест" });
   }
 });
 
