@@ -309,6 +309,131 @@ summary {
   border-radius: var(--radius-sm);
 }
 
+.lecture-text-panel {
+  overflow: hidden;
+  margin-top: 18px;
+  border: 1px solid #777b84;
+  border-radius: var(--radius-md);
+  background: var(--paper-raised);
+  color: var(--ink);
+}
+
+.lecture-text-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 64px;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 17px;
+  border: 0;
+  background: #252b35;
+  color: var(--paper);
+  cursor: pointer;
+  text-align: left;
+}
+
+.lecture-text-toggle > span {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.lecture-text-toggle strong {
+  font-size: 16px;
+  line-height: 1.35;
+}
+
+.lecture-text-toggle small {
+  color: #c7c9c1;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.lecture-text-toggle > b {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 1px solid #777b84;
+  border-radius: 50%;
+  color: var(--lime);
+  font-size: 22px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.lecture-text-toggle[aria-expanded="true"] {
+  border-bottom: 1px solid var(--line);
+  background: #202630;
+}
+
+.lecture-text-content {
+  padding: clamp(18px, 4vw, 32px);
+  background: var(--paper-raised);
+}
+
+.lecture-text-content article {
+  max-width: 72ch;
+  margin: 0 auto;
+}
+
+.lecture-text-content article p {
+  margin: 0 0 1.15em;
+  color: #292e36;
+  font-size: 16px;
+  line-height: 1.78;
+  overflow-wrap: anywhere;
+}
+
+.lecture-text-content article p:last-child {
+  margin-bottom: 0;
+}
+
+.lecture-text-loading,
+.lecture-text-note,
+.lecture-text-error {
+  max-width: 72ch;
+  margin: 0 auto 16px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.lecture-text-loading {
+  color: #6155aa;
+  font-weight: 800;
+}
+
+.lecture-text-note {
+  padding: 11px 13px;
+  border-left: 4px solid var(--violet);
+  background: var(--violet-soft);
+  color: #4d466e;
+}
+
+.lecture-text-error {
+  padding: 13px;
+  border-left: 4px solid var(--coral);
+  background: var(--danger-soft);
+  color: #59150a;
+}
+
+.lecture-text-error p {
+  margin: 0 0 10px;
+}
+
+.lecture-text-error button {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid #9c4838;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font-weight: 800;
+}
+
 .lecture-queue-tools {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) auto;

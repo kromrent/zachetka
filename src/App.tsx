@@ -214,6 +214,7 @@ function Home({ done, subject, selectSubject, navigate }: { done: number; subjec
 
 type LectureTrack = { id: string; subject: string; section: string; sectionKey: string; title: string; mode: "question" | "section"; topics?: string[]; part?: number; partCount?: number };
 function Lectures({ onBack }: { onBack: () => void }) {
+  type LectureTextEntry = { text?: string; source?: "generated" | "transcribed" | "cache"; loading: boolean; error?: string };
   const [lectureMode, setLectureMode] = useState<"questions" | "sections">("questions");
   const [subjectId, setSubjectId] = useState("all"); const [sectionId, setSectionId] = useState("all");
   const [index, setIndex] = useState(() => Number(localStorage.getItem("exam-lecture-index") || 0));
@@ -222,7 +223,11 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const [repeatCurrent, setRepeatCurrent] = useState(() => localStorage.getItem("exam-lecture-repeat") === "true");
   const [queueQuery, setQueueQuery] = useState(""); const [unlistenedOnly, setUnlistenedOnly] = useState(false);
   const [listeningProgress, setListeningProgress] = useState<Record<string, LectureProgress>>(() => readStore("exam-lecture-progress", {}));
+  const [lectureTextCache, setLectureTextCache] = useState<Record<string, LectureTextEntry>>({});
+  const [expandedTextTrackId, setExpandedTextTrackId] = useState("");
   const audioRef = useRef<HTMLAudioElement>(null); const activeRowRef = useRef<HTMLButtonElement>(null); const urlRef = useRef(""); const loadedTrackRef = useRef<LectureTrack | null>(null); const loadVersionRef = useRef(0); const recordListeningRef = useRef<(force?: boolean) => void>(() => undefined); const lastProgressWrite = useRef(0); const lastMediaTime = useRef(0); const pendingRanges = useRef<ListeningRange[]>([]); const seeking = useRef(false);
+  const lectureTextCacheRef = useRef<Record<string, LectureTextEntry>>({});
+  const lectureTextRequestsRef = useRef<Record<string, AbortController>>({});
   const sections = subjectId === "all" ? [] : questionBanks.find((bank) => bank.id === subjectId)?.sections || [];
   const tracks = useMemo<LectureTrack[]>(() => {
     const banks = questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId);
@@ -267,6 +272,33 @@ function Lectures({ onBack }: { onBack: () => void }) {
   useEffect(() => () => { loadVersionRef.current += 1; recordListeningRef.current(true); if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
   useEffect(() => { activeRowRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" }); }, [current?.id, queueQuery, unlistenedOnly]);
   const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
+  const updateLectureText = (trackId: string, patch: Partial<LectureTextEntry>) => {
+    setLectureTextCache((previous) => {
+      const next = { ...previous, [trackId]: { ...previous[trackId], loading: false, ...patch } };
+      lectureTextCacheRef.current = next;
+      return next;
+    });
+  };
+  const loadLectureText = async (track: LectureTrack, retry = false) => {
+    const cached = lectureTextCacheRef.current[track.id];
+    if (!retry && (cached?.text || cached?.loading)) return;
+    if (lectureTextRequestsRef.current[track.id]) return;
+    const controller = new AbortController();
+    lectureTextRequestsRef.current[track.id] = controller;
+    updateLectureText(track.id, { loading: true, error: "" });
+    try {
+      const response = await fetch("/api/lectures/text", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody(track)), signal: controller.signal });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Текст лекции недоступен");
+      if (typeof body.text !== "string" || !body.text.trim()) throw new Error("Сервер вернул пустой текст лекции");
+      updateLectureText(track.id, { text: body.text.trim(), source: body.source, loading: false, error: "" });
+    } catch (e: any) {
+      if (e?.name !== "AbortError") updateLectureText(track.id, { loading: false, error: e?.message || "Не удалось загрузить текст лекции" });
+    } finally {
+      if (lectureTextRequestsRef.current[track.id] === controller) delete lectureTextRequestsRef.current[track.id];
+    }
+  };
+  useEffect(() => () => { Object.values(lectureTextRequestsRef.current).forEach((controller) => controller.abort()); }, []);
   const cacheLocation = (track: LectureTrack) => {
     const version = "v4";
     return { cacheName: `zachetka-lectures-${version}`, cacheKey: `/lecture-cache-${version}/${track.id}.mp3` };
@@ -327,6 +359,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
   }, []);
   useEffect(() => { if (!("mediaSession" in navigator)) return; navigator.mediaSession.setActionHandler("nexttrack", () => move(1)); navigator.mediaSession.setActionHandler("previoustrack", () => move(-1)); return () => { navigator.mediaSession.setActionHandler("nexttrack", null); navigator.mediaSession.setActionHandler("previoustrack", null); }; });
   const currentProgress = current ? listeningProgress[current.id] : null;
+  const currentLectureText = current ? lectureTextCache[current.id] : undefined;
   return <section className="lectures-page">
     <button className="back" onClick={() => { loadVersionRef.current += 1; recordListening(true); onBack(); }}>← На главную</button>
     <div className="lecture-head"><div><p className="eyebrow">Фоновое обучение</p><h1>Лекции</h1><p>Слушай отдельные вопросы подряд или одну цельную лекцию по всему разделу.</p></div><span>♫</span></div>
@@ -344,6 +377,19 @@ function Lectures({ onBack }: { onBack: () => void }) {
       {currentProgress && <p className={`lecture-listened ${currentProgress.completed ? "completed" : ""}`}>{currentProgress.completed ? "✓ Засчитано" : `Прослушано ${Math.round(currentProgress.percent)}%`} · засчитывается после 50%</p>}
       {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : currentProgress?.completed ? "▶ Прослушать ещё раз" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline loop={repeatCurrent} onPlay={() => { setIsPlaying(true); if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null); }} onSeeking={() => { seeking.current = true; if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; }} onSeeked={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; seeking.current = false; }} onTimeUpdate={() => recordListening()} onPause={() => { setIsPlaying(false); recordListening(true); }} onEnded={() => { setIsPlaying(false); recordListening(true); if (!repeatCurrent) move(1); }} onLoadedMetadata={() => { if (!audioRef.current) return; audioRef.current.playbackRate = speed; const loadedTrack = loadedTrackRef.current; const saved = loadedTrack ? readStore<Record<string, LectureProgress>>("exam-lecture-progress", {})[loadedTrack.id] : null; const position = saved?.positionSeconds ?? 0; if (saved && !saved.completed && position > 0 && position < audioRef.current.duration * .95) audioRef.current.currentTime = position; lastMediaTime.current = audioRef.current.currentTime; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button className={repeatCurrent ? "active" : ""} aria-pressed={repeatCurrent} onClick={toggleRepeat}>↻ {repeatCurrent ? "Повтор включён" : "На повтор"}</button><button onClick={() => move(1)}>Следующая →</button></div></>}
       {loading && <p className="lecture-loading" role="status" aria-live="polite">{audioUrl ? "Готовлю следующий трек…" : "Загружаю аудио…"}</p>}{error && <p className="inline-error" role="alert" aria-live="assertive">{error}</p>}
+      <section className="lecture-text-panel">
+        <button type="button" className="lecture-text-toggle" aria-expanded={expandedTextTrackId === current.id} aria-controls={`lecture-text-${current.id}`} onClick={() => {
+          const willOpen = expandedTextTrackId !== current.id;
+          setExpandedTextTrackId(willOpen ? current.id : "");
+          if (willOpen) void loadLectureText(current);
+        }}><span><strong>Текст лекции</strong><small>{currentLectureText?.source === "transcribed" ? "Автоматическая расшифровка старой записи" : currentLectureText?.text ? "Точный текст озвучки" : "Читать вместе с аудио"}</small></span><b aria-hidden="true">{expandedTextTrackId === current.id ? "−" : "+"}</b></button>
+        {expandedTextTrackId === current.id && <div id={`lecture-text-${current.id}`} className="lecture-text-content" role="region" aria-label={`Текст лекции: ${current.title}`} aria-busy={Boolean(currentLectureText?.loading)}>
+          {currentLectureText?.loading && <p className="lecture-text-loading" role="status" aria-live="polite">Загружаю текст лекции…</p>}
+          {currentLectureText?.error && <div className="lecture-text-error" role="alert"><p>{currentLectureText.error}</p><button type="button" onClick={() => void loadLectureText(current, true)}>Попробовать ещё раз</button></div>}
+          {currentLectureText?.source === "transcribed" && currentLectureText.text && <p className="lecture-text-note">Этот текст восстановлен из старого MP3 автоматически, поэтому в терминах и знаках препинания возможны небольшие неточности.</p>}
+          {currentLectureText?.text && <article>{currentLectureText.text.split(/\n\s*\n/).filter(Boolean).map((paragraph, paragraphIndex) => <p key={`${current.id}-paragraph-${paragraphIndex}`}>{paragraph}</p>)}</article>}
+        </div>}
+      </section>
     </div>}
     {current && <LectureFollowUps track={current}/>}
     {current && audioUrl && <aside className="lecture-mini-player" aria-label="Компактный плеер">

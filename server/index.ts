@@ -1,7 +1,7 @@
 import express from "express";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import ffmpegPath from "ffmpeg-static";
@@ -23,26 +23,67 @@ const run = promisify(execFile);
 const lectureAudioJobs = new Map<string, Promise<Buffer>>();
 const lectureCacheMaxBytes = Number(process.env.LECTURE_CACHE_MAX_BYTES || 800 * 1024 * 1024);
 const lectureAudioBitrate = process.env.LECTURE_AUDIO_BITRATE || "48k";
+const lectureTranscribeModel = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+const lectureSpeechChunkMaxCharacters = 4000;
 const configuredLectureSpeechSpeed = Number(process.env.LECTURE_SPEECH_SPEED || 1.2);
 const lectureSpeechSpeed = Number.isFinite(configuredLectureSpeechSpeed) ? Math.min(4, Math.max(0.25, configuredLectureSpeechSpeed)) : 1.2;
 
-const compressLectureAudio = async (source: Buffer) => {
-  if (!ffmpegPath) return source;
+const splitLectureTextForSpeech = (text: string, maxCharacters = lectureSpeechChunkMaxCharacters) => {
+  const chunks: string[] = [];
+  let remaining = text.trim();
+  while (remaining.length > maxCharacters) {
+    const window = remaining.slice(0, maxCharacters + 1);
+    const sentenceAt = Math.max(
+      window.lastIndexOf(". ", maxCharacters),
+      window.lastIndexOf("! ", maxCharacters),
+      window.lastIndexOf("? ", maxCharacters)
+    );
+    const candidates = [
+      { at: window.lastIndexOf("\n\n", maxCharacters), separatorLength: 2 },
+      { at: sentenceAt, separatorLength: 1 },
+      { at: window.lastIndexOf("\n", maxCharacters), separatorLength: 1 },
+      { at: window.lastIndexOf(" ", maxCharacters), separatorLength: 0 }
+    ];
+    const boundary = candidates.find((candidate) => candidate.at >= maxCharacters * 0.55);
+    const end = boundary ? boundary.at + boundary.separatorLength : maxCharacters;
+    const chunk = remaining.slice(0, end).trim();
+    if (!chunk) break;
+    chunks.push(chunk);
+    remaining = remaining.slice(end).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+};
+
+const compressLectureAudio = async (sources: Buffer | Buffer[]) => {
+  const parts = Array.isArray(sources) ? sources : [sources];
+  const fallback = Buffer.concat(parts);
+  if (!ffmpegPath) return fallback;
   const directory = await mkdtemp(path.join(tmpdir(), "zachetka-audio-"));
   const input = path.join(directory, "source.mp3");
+  const manifest = path.join(directory, "parts.txt");
   const output = path.join(directory, "compressed.mp3");
   try {
-    await writeFile(input, source);
+    let inputArguments: string[];
+    if (parts.length === 1) {
+      await writeFile(input, parts[0]);
+      inputArguments = ["-i", input];
+    } else {
+      const filenames = parts.map((_, index) => path.join(directory, `part-${String(index).padStart(3, "0")}.mp3`));
+      await Promise.all(filenames.map((filename, index) => writeFile(filename, parts[index])));
+      await writeFile(manifest, filenames.map((filename) => `file '${filename}'`).join("\n"));
+      inputArguments = ["-f", "concat", "-safe", "0", "-i", manifest];
+    }
     await run(ffmpegPath, [
-      "-hide_banner", "-loglevel", "error", "-i", input,
+      "-hide_banner", "-loglevel", "error", ...inputArguments,
       "-map_metadata", "-1", "-ac", "1", "-ar", "24000",
       "-codec:a", "libmp3lame", "-b:a", lectureAudioBitrate, "-y", output
     ], { timeout: 120_000, maxBuffer: 100_000 });
     const compressed = await readFile(output);
-    return compressed.length < source.length ? compressed : source;
+    return parts.length > 1 || compressed.length < fallback.length ? compressed : fallback;
   } catch (error) {
     console.error("Не удалось сжать аудиолекцию, сохраняю исходный MP3", error);
-    return source;
+    return fallback;
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -178,13 +219,115 @@ const ReferenceAnswer = z.object({
   keyPoints: z.array(z.string()).min(3).max(10)
 });
 
+const LectureInput = z.object({
+  title: z.string().min(5).max(3000),
+  mode: z.enum(["question", "section"]).default("question"),
+  topics: z.array(z.string().min(3).max(2000)).max(60).optional()
+});
+type LectureInputData = z.infer<typeof LectureInput>;
+type LectureTextSource = "generated" | "transcribed";
+type LectureTextRecord = { text: string; source: LectureTextSource };
+const lectureTextJobs = new Map<string, Promise<LectureTextRecord>>();
+
+// This seed and JSON serialization intentionally match the existing audio
+// cache key exactly. Changing either would orphan all already generated MP3s.
+const lectureCacheKeyFor = (input: LectureInputData) => createHash("sha256")
+  .update(`lecture-audio-2026-07-29-v3\n${JSON.stringify(input)}`)
+  .digest("hex");
+
+const readLectureText = async (cacheKey: string): Promise<LectureTextRecord | null> => {
+  const row = (await database.query<{ text: string; source: string }>(
+    "SELECT text,source FROM lecture_text WHERE cache_key=$1",
+    [cacheKey]
+  )).rows[0];
+  if (!row) return null;
+  await database.query("UPDATE lecture_text SET last_accessed_at=CURRENT_TIMESTAMP WHERE cache_key=$1", [cacheKey]);
+  return { text: row.text, source: row.source === "transcribed" ? "transcribed" : "generated" };
+};
+
+const saveLectureText = async (cacheKey: string, record: LectureTextRecord): Promise<LectureTextRecord> => {
+  const inserted = (await database.query<{ text: string; source: string }>(
+    `INSERT INTO lecture_text(cache_key,text,source)
+     VALUES($1,$2,$3)
+     ON CONFLICT(cache_key) DO NOTHING
+     RETURNING text,source`,
+    [cacheKey, record.text, record.source]
+  )).rows[0];
+  if (inserted) return record;
+  // Another request/process won the race. Always use its persisted script so
+  // later TTS and the text endpoint expose one canonical value.
+  return (await readLectureText(cacheKey)) || record;
+};
+
+const lectureSourceFor = (input: LectureInputData) => input.mode === "section"
+  ? `РАЗДЕЛ: ${input.title}\n\nВОПРОСЫ, КОТОРЫЕ НУЖНО СВЯЗНО РАСКРЫТЬ:\n${(input.topics || []).map((topic, index) => `${index + 1}. ${topic}`).join("\n")}`
+  : input.title;
+
+const generateLectureText = async (input: LectureInputData): Promise<string> => {
+  if (!client) throw Object.assign(new Error("OpenAI не настроен"), { code: "ai_not_configured" });
+  const isSection = input.mode === "section";
+  const lecture = await client.responses.create({
+    model,
+    reasoning: { effort: "none" },
+    max_output_tokens: isSection ? 1900 : 720,
+    instructions: isSection
+      ? `Подготовь одну часть большой учебной аудиолекции по разделу вступительного экзамена. Раскрой все переданные вопросы по очереди, каждый как самостоятельный экзаменационный ответ уровня 21–25 из 25: полный, логичный и терминологически точный, с относящимися к вопросу определениями, связями, классификациями, принципами работы и существенными особенностями. Перед каждым ответом обязательно дословно используй переход: «Вопрос: [полная формулировка]. Ответ:», а затем сразу давай содержательный ответ. Не объединяй вопросы так, чтобы какой-либо из них потерял отдельный ответ. Пиши связным разговорным текстом на русском языке без markdown, таблиц и нумерованных списков. Термины и код проговаривай понятно на слух. Не добавляй приветствия, воду и общий повтор в конце. Текст обязан оставаться компактнее 1800 токенов для последующей озвучки; полнота по критериям важнее фиксированной длительности.`
+      : `Дай полноценный учебный ответ на один вопрос вступительного экзамена, рассчитанный на максимальную оценку 21–25 из 25. Начни дословно с конструкции «Вопрос: [полная формулировка вопроса]. Ответ:», после чего сразу переходи к содержанию. Ответ должен быть логичным и терминологически точным: дай относящиеся к вопросу определения, раскрой необходимые связи, классификации, принципы работы и существенные особенности. Не добавляй сведения, не относящиеся к вопросу. Удали воду, длинные вступления и повторный пересказ в конце. Пиши связным разговорным текстом на русском языке без markdown, таблиц и нумерованных списков, чтобы материал было удобно воспринимать только на слух. Термины и фрагменты кода проговаривай понятно. Цель — компактный ответ примерно на 1,5–2 минуты; сложный составной вопрос можно раскрыть дольше, если иначе пострадают критерии максимальной оценки.`,
+    input: lectureSourceFor(input)
+  });
+  const text = lecture.output_text.trim();
+  if (!text) throw new Error("OpenAI вернул пустой текст лекции");
+  return text;
+};
+
+const transcribeLectureAudio = async (cacheKey: string, audio: Buffer, contentType: string): Promise<string> => {
+  if (!client) throw Object.assign(new Error("OpenAI не настроен"), { code: "ai_not_configured" });
+  const transcription = await client.audio.transcriptions.create({
+    file: await toFile(audio, `${cacheKey}.mp3`, { type: contentType || "audio/mpeg" }),
+    model: lectureTranscribeModel,
+    language: "ru",
+    response_format: "json"
+  });
+  const text = transcription.text.trim();
+  if (!text) throw new Error("OpenAI вернул пустую расшифровку лекции");
+  return text;
+};
+
+const createLectureText = async (cacheKey: string, input: LectureInputData): Promise<LectureTextRecord> => {
+  // Old MP3s predate lecture_text. Their text must come from that exact audio;
+  // generating a fresh answer could make the displayed text disagree with it.
+  const cachedAudio = (await database.query<{ audio: Buffer; content_type: string }>(
+    "SELECT audio,content_type FROM lecture_audio WHERE cache_key=$1",
+    [cacheKey]
+  )).rows[0];
+  const record: LectureTextRecord = cachedAudio
+    ? { text: await transcribeLectureAudio(cacheKey, cachedAudio.audio, cachedAudio.content_type), source: "transcribed" }
+    : { text: await generateLectureText(input), source: "generated" };
+  return saveLectureText(cacheKey, record);
+};
+
+const getOrCreateLectureText = async (cacheKey: string, input: LectureInputData) => {
+  const cached = await readLectureText(cacheKey);
+  if (cached) return { ...cached, cache: "HIT" as const };
+  const existingJob = lectureTextJobs.get(cacheKey);
+  if (existingJob) return { ...(await existingJob), cache: "COALESCED" as const };
+  const job = createLectureText(cacheKey, input);
+  lectureTextJobs.set(cacheKey, job);
+  try {
+    return { ...(await job), cache: "MISS" as const };
+  } finally {
+    if (lectureTextJobs.get(cacheKey) === job) lectureTextJobs.delete(cacheKey);
+  }
+};
+
 app.get("/api/status", (_request, response) => response.json({
   ok: true,
   ai: Boolean(client),
   java: process.env.ENABLE_LOCAL_JAVA === "true",
   model: client ? model : null,
-  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed },
-  features: { lectureFollowUps: true, uniqueListeningProgress: true }
+  lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed, maxCharactersPerPart: lectureSpeechChunkMaxCharacters },
+  lectureText: { transcriptionModel: lectureTranscribeModel },
+  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true }
 }));
 
 app.post("/api/grade/written", authRequired, async (request, response) => {
@@ -290,46 +433,54 @@ app.post("/api/lectures/follow-up", authRequired, async (request, response) => {
   }
 });
 
-app.post("/api/lectures/audio", authRequired, async (request, response) => {
-  if (!client) return response.status(503).json({ error: "Добавь OPENAI_API_KEY в настройки сервера" });
-  const parsed = z.object({
-    title: z.string().min(5).max(3000),
-    mode: z.enum(["question", "section"]).default("question"),
-    topics: z.array(z.string().min(3).max(2000)).max(60).optional()
-  }).safeParse(request.body);
+app.post("/api/lectures/text", authRequired, async (request, response) => {
+  const parsed = LectureInput.safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: "Некорректная тема лекции" });
   try {
-    const cacheKey = createHash("sha256").update(`lecture-audio-2026-07-29-v3\n${JSON.stringify(parsed.data)}`).digest("hex");
+    const result = await getOrCreateLectureText(lectureCacheKeyFor(parsed.data), parsed.data);
+    response.setHeader("X-Lecture-Text-Cache", result.cache);
+    response.setHeader("Cache-Control", "private, max-age=31536000");
+    response.json({ text: result.text, source: result.source });
+  } catch (error) {
+    console.error(error);
+    const code = (error as { code?: string })?.code;
+    if (code === "ai_not_configured") {
+      return response.status(503).json({ error: "Текст этой лекции ещё не сохранён, а OpenAI не настроен" });
+    }
+    if (code === "insufficient_quota") {
+      return response.status(402).json({ error: "Баланс OpenAI закончился; готовые тексты лекций сохранены" });
+    }
+    response.status(502).json({ error: "Не удалось подготовить текст лекции" });
+  }
+});
+
+app.post("/api/lectures/audio", authRequired, async (request, response) => {
+  const parsed = LectureInput.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: "Некорректная тема лекции" });
+  try {
+    const cacheKey = lectureCacheKeyFor(parsed.data);
     const cached = (await database.query<{ audio: Buffer; content_type: string }>("SELECT audio,content_type FROM lecture_audio WHERE cache_key=$1", [cacheKey])).rows[0];
     if (cached) {
       await database.query("UPDATE lecture_audio SET last_accessed_at=CURRENT_TIMESTAMP WHERE cache_key=$1", [cacheKey]);
       response.setHeader("Content-Type", cached.content_type); response.setHeader("Content-Length", String(cached.audio.length)); response.setHeader("X-Lecture-Cache", "HIT"); response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
       return response.send(cached.audio);
     }
+    if (!client) return response.status(503).json({ error: "Добавь OPENAI_API_KEY в настройки сервера" });
     const existingJob = lectureAudioJobs.get(cacheKey);
     const audioJob = existingJob || (async () => {
-    const isSection = parsed.data.mode === "section";
-    const source = isSection
-      ? `РАЗДЕЛ: ${parsed.data.title}\n\nВОПРОСЫ, КОТОРЫЕ НУЖНО СВЯЗНО РАСКРЫТЬ:\n${(parsed.data.topics || []).map((topic, index) => `${index + 1}. ${topic}`).join("\n")}`
-      : parsed.data.title;
-    const lecture = await client.responses.create({
-      model,
-      reasoning: { effort: "none" },
-      max_output_tokens: isSection ? 1900 : 720,
-      instructions: isSection
-        ? `Подготовь одну часть большой учебной аудиолекции по разделу вступительного экзамена. Раскрой все переданные вопросы по очереди, каждый как самостоятельный экзаменационный ответ уровня 21–25 из 25: полный, логичный и терминологически точный, с относящимися к вопросу определениями, связями, классификациями, принципами работы и существенными особенностями. Перед каждым ответом обязательно дословно используй переход: «Вопрос: [полная формулировка]. Ответ:», а затем сразу давай содержательный ответ. Не объединяй вопросы так, чтобы какой-либо из них потерял отдельный ответ. Пиши связным разговорным текстом на русском языке без markdown, таблиц и нумерованных списков. Термины и код проговаривай понятно на слух. Не добавляй приветствия, воду и общий повтор в конце. Текст обязан оставаться компактнее 1800 токенов для последующей озвучки; полнота по критериям важнее фиксированной длительности.`
-        : `Дай полноценный учебный ответ на один вопрос вступительного экзамена, рассчитанный на максимальную оценку 21–25 из 25. Начни дословно с конструкции «Вопрос: [полная формулировка вопроса]. Ответ:», после чего сразу переходи к содержанию. Ответ должен быть логичным и терминологически точным: дай относящиеся к вопросу определения, раскрой необходимые связи, классификации, принципы работы и существенные особенности. Не добавляй сведения, не относящиеся к вопросу. Удали воду, длинные вступления и повторный пересказ в конце. Пиши связным разговорным текстом на русском языке без markdown, таблиц и нумерованных списков, чтобы материал было удобно воспринимать только на слух. Термины и фрагменты кода проговаривай понятно. Цель — компактный ответ примерно на 1,5–2 минуты; сложный составной вопрос можно раскрыть дольше, если иначе пострадают критерии максимальной оценки.`,
-      input: source
-    });
-    const speech = await client.audio.speech.create({
-      model: (process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts") as "gpt-4o-mini-tts",
-      voice: "alloy",
-      input: lecture.output_text,
-      instructions: "Говори по-русски спокойно, ясно и доброжелательно, как преподаватель на лекции. Делай небольшие паузы между смысловыми частями.",
-      speed: lectureSpeechSpeed,
-      response_format: "mp3"
-    });
-    const audio = await compressLectureAudio(Buffer.from(await speech.arrayBuffer()));
+      const lecture = await getOrCreateLectureText(cacheKey, parsed.data);
+      // The API accepts at most 4096 characters per speech request. Every part
+      // is a substring of the already persisted canonical text, and ffmpeg
+      // joins the resulting MP3s back into one track.
+      const speechParts = await Promise.all(splitLectureTextForSpeech(lecture.text).map((input) => client.audio.speech.create({
+        model: (process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts") as "gpt-4o-mini-tts",
+        voice: "alloy",
+        input,
+        instructions: "Говори по-русски спокойно, ясно и доброжелательно, как преподаватель на лекции. Делай небольшие паузы между смысловыми частями.",
+        speed: lectureSpeechSpeed,
+        response_format: "mp3"
+      })));
+      const audio = await compressLectureAudio(await Promise.all(speechParts.map(async (speech) => Buffer.from(await speech.arrayBuffer()))));
       if (audio.length <= lectureCacheMaxBytes) {
         const usage = Number((await database.query<{ total: string }>("SELECT COALESCE(SUM(byte_size),0)::text AS total FROM lecture_audio")).rows[0]?.total || 0);
         let bytesToFree = usage + audio.length - lectureCacheMaxBytes;
@@ -360,8 +511,12 @@ app.post("/api/lectures/audio", authRequired, async (request, response) => {
 });
 
 app.get("/api/lectures/cache-status", authRequired, async (_request, response) => {
-  const status = (await database.query<{ count: string; bytes: string }>("SELECT COUNT(*)::text AS count,COALESCE(SUM(byte_size),0)::text AS bytes FROM lecture_audio")).rows[0];
-  response.json({ tracks: Number(status?.count || 0), bytes: Number(status?.bytes || 0), maxBytes: lectureCacheMaxBytes });
+  const [audioResult, textResult] = await Promise.all([
+    database.query<{ count: string; bytes: string }>("SELECT COUNT(*)::text AS count,COALESCE(SUM(byte_size),0)::text AS bytes FROM lecture_audio"),
+    database.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM lecture_text")
+  ]);
+  const status = audioResult.rows[0];
+  response.json({ tracks: Number(status?.count || 0), texts: Number(textResult.rows[0]?.count || 0), bytes: Number(status?.bytes || 0), maxBytes: lectureCacheMaxBytes });
 });
 
 app.post("/api/java/compile", authRequired, async (request, response) => {

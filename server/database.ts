@@ -36,6 +36,13 @@ export const databaseReady = database.query(`
     last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
   CREATE INDEX IF NOT EXISTS lecture_audio_last_accessed_idx ON lecture_audio(last_accessed_at);
+  CREATE TABLE IF NOT EXISTS lecture_text (
+    cache_key TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'generated',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
 `).then(() => undefined);
 
 export type DbUser = { id: number; username: string | null; telegram_id: string | null; display_name: string };
