@@ -15,13 +15,48 @@ const saveReference = (item: SavedReference) => { const current = readStore<Reco
 const progressSnapshot = () => Object.fromEntries(Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter((key): key is string => Boolean(key?.startsWith("exam-"))).map((key) => [key, localStorage.getItem(key)]));
 const syncProgress = () => fetch("/api/progress", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(progressSnapshot()) }).catch(() => null);
 type Screen = "home" | "learn" | "quiz" | "written" | "code" | "exam" | "answers" | "stats" | "account" | "lectures";
+type AppHistoryState = { zachetka: true; screen: Screen; subjectId: string; depth: number };
+const screens: Screen[] = ["home", "learn", "quiz", "written", "code", "exam", "answers", "stats", "account", "lectures"];
+const isScreen = (value: unknown): value is Screen => typeof value === "string" && screens.includes(value as Screen);
+const historyState = (): Partial<AppHistoryState> | null => {
+  if (typeof window === "undefined") return null;
+  const state = window.history.state;
+  return state?.zachetka === true ? state as Partial<AppHistoryState> : null;
+};
+const findSubject = (id: unknown) => subjects.find((item) => item.id === id);
 const brackets = ["{", "}", "(", ")", "[", "]", ";", "=", "=>"];
 
 function App() {
-  const [screen, setScreen] = useState<Screen>("home");
-  const [subject, setSubject] = useState(subjects[2]);
+  const [screen, setScreen] = useState<Screen>(() => {
+    const saved = historyState()?.screen;
+    return isScreen(saved) ? saved : "home";
+  });
+  const [subject, setSubject] = useState<Subject>(() => findSubject(historyState()?.subjectId) || findSubject(localStorage.getItem("exam-selected-subject")) || findSubject("java") || subjects[0]);
   const [done, setDone] = useState(() => Number(localStorage.getItem("exam-done") || 0));
   const [user, setUser] = useState<AccountUser | null>(null);
+  useEffect(() => {
+    const current = historyState();
+    const initialState: AppHistoryState = {
+      zachetka: true,
+      screen,
+      subjectId: subject.id,
+      depth: typeof current?.depth === "number" && current.depth >= 0 ? current.depth : 0
+    };
+    window.history.replaceState(initialState, "");
+    const restore = (event: PopStateEvent) => {
+      const state = event.state as Partial<AppHistoryState> | null;
+      if (state?.zachetka !== true || !isScreen(state.screen)) return;
+      const restoredSubject = findSubject(state.subjectId);
+      if (restoredSubject) {
+        setSubject(restoredSubject);
+        localStorage.setItem("exam-selected-subject", restoredSubject.id);
+      }
+      setScreen(state.screen);
+      window.scrollTo(0, 0);
+    };
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
   useEffect(() => {
     fetch("/api/auth/me").then((r) => r.json()).then((body) => setUser(body.user)).catch(() => null);
     const telegram = (window as any).Telegram?.WebApp;
@@ -43,26 +78,89 @@ function App() {
   }, [user]);
 
   const navigate = (next: Screen, selected?: Subject) => {
-    if (selected) setSubject(selected);
+    const nextSubject = selected || subject;
+    if (selected) {
+      setSubject(selected);
+      localStorage.setItem("exam-selected-subject", selected.id);
+    }
+    if (next === screen && nextSubject.id === subject.id) {
+      window.scrollTo(0, 0);
+      return;
+    }
+    const current = historyState();
+    const depth = typeof current?.depth === "number" && current.depth >= 0 ? current.depth + 1 : 1;
+    window.history.pushState({ zachetka: true, screen: next, subjectId: nextSubject.id, depth } satisfies AppHistoryState, "");
     setScreen(next);
     window.scrollTo(0, 0);
   };
+  const selectSubject = (selected: Subject) => {
+    setSubject(selected);
+    localStorage.setItem("exam-selected-subject", selected.id);
+    const current = historyState();
+    window.history.replaceState({
+      zachetka: true,
+      screen,
+      subjectId: selected.id,
+      depth: typeof current?.depth === "number" && current.depth >= 0 ? current.depth : 0
+    } satisfies AppHistoryState, "");
+  };
+  const goHome = () => {
+    if (screen === "home") {
+      window.scrollTo(0, 0);
+      return;
+    }
+    const current = historyState();
+    if (typeof current?.depth === "number" && current.depth > 0) {
+      window.history.go(-current.depth);
+      return;
+    }
+    window.history.replaceState({ zachetka: true, screen: "home", subjectId: subject.id, depth: 0 } satisfies AppHistoryState, "");
+    setScreen("home");
+    window.scrollTo(0, 0);
+  };
+  const goBack = () => {
+    const current = historyState();
+    if (screen !== "home" && typeof current?.depth === "number" && current.depth > 0) {
+      window.history.back();
+      return;
+    }
+    goHome();
+  };
+  useEffect(() => {
+    const backButton = (window as any).Telegram?.WebApp?.BackButton;
+    if (!backButton) return;
+    const handleBack = () => goBack();
+    if (screen === "home") backButton.hide();
+    else {
+      backButton.show();
+      backButton.onClick(handleBack);
+    }
+    return () => backButton.offClick?.(handleBack);
+  }, [screen, subject.id]);
+
+  const learningScreens: Screen[] = ["learn", "quiz", "written", "code", "exam", "answers"];
 
   return <main className="shell">
     <header className="topbar">
-      <button className="brand" onClick={() => navigate("home")} aria-label="На главную"><span>З</span> зачётка</button>
-      <div className="top-actions"><button className={`account-pill ${user ? "online" : ""}`} onClick={() => navigate("account")}>{user ? user.displayName : "Войти"}</button><button className="avatar" onClick={() => navigate("stats")}>{done}</button></div>
+      <button className="brand" onClick={goHome} aria-label="На главную"><span>З</span> зачётка</button>
+      <div className="top-actions"><button className={`account-pill ${user ? "online" : ""}`} onClick={() => navigate("account")}>{user ? user.displayName : "Войти"}</button><button className="avatar" aria-label={`Прогресс: завершено подходов — ${done}`} title="Открыть прогресс" onClick={() => navigate("stats")}>{done}</button></div>
     </header>
-    {screen === "home" && <Home done={done} navigate={navigate} />}
-    {screen === "learn" && <Learn subject={subject} onBack={() => navigate("home")} />}
-    {screen === "quiz" && <Quiz subject={subject} onBack={() => navigate("home")} onComplete={() => { const n = done + 1; setDone(n); localStorage.setItem("exam-done", String(n)); }} />}
-    {screen === "written" && <Written subject={subject} onBack={() => navigate("home")} />}
-    {screen === "code" && <CodeTask onBack={() => navigate("home")} />}
-    {screen === "exam" && <Exam subject={subject} onBack={() => navigate("home")} />}
-    {screen === "answers" && <AnswerLibrary onBack={() => navigate("home")} />}
-    {screen === "stats" && <Stats done={done} onBack={() => navigate("home")} />}
-    {screen === "account" && <Account user={user} setUser={setUser} onBack={() => navigate("home")} />}
-    {screen === "lectures" && <Lectures onBack={() => navigate("home")} />}
+    {screen === "home" && <Home done={done} subject={subject} selectSubject={selectSubject} navigate={navigate} />}
+    {screen === "learn" && <Learn subject={subject} onBack={goBack} />}
+    {screen === "quiz" && <Quiz subject={subject} onBack={goBack} onComplete={() => { const n = done + 1; setDone(n); localStorage.setItem("exam-done", String(n)); }} />}
+    {screen === "written" && <Written subject={subject} onBack={goBack} />}
+    {screen === "code" && <CodeTask subject={subject} onBack={goBack} />}
+    {screen === "exam" && <Exam subject={subject} onBack={goBack} />}
+    {screen === "answers" && <AnswerLibrary onBack={goBack} />}
+    {screen === "stats" && <Stats done={done} onBack={goBack} onOpenSubject={(selected) => navigate("learn", selected)} />}
+    {screen === "account" && <Account user={user} setUser={setUser} onBack={goBack} />}
+    {screen === "lectures" && <Lectures onBack={goBack} />}
+    <nav className="mobile-nav" aria-label="Основная навигация">
+      <button className={screen === "home" ? "active" : ""} aria-current={screen === "home" ? "page" : undefined} onClick={goHome}><b aria-hidden="true">⌂</b><span>Главная</span></button>
+      <button className={learningScreens.includes(screen) ? "active" : ""} aria-current={learningScreens.includes(screen) ? "page" : undefined} onClick={() => navigate("learn", subject)}><b aria-hidden="true">□</b><span>Учить</span></button>
+      <button className={screen === "lectures" ? "active" : ""} aria-current={screen === "lectures" ? "page" : undefined} onClick={() => navigate("lectures")}><b aria-hidden="true">♫</b><span>Слушать</span></button>
+      <button className={screen === "stats" ? "active" : ""} aria-current={screen === "stats" ? "page" : undefined} onClick={() => navigate("stats")}><b aria-hidden="true">↗</b><span>Прогресс</span></button>
+    </nav>
   </main>;
 }
 
@@ -73,24 +171,38 @@ function Account({ user, setUser, onBack }: { user: AccountUser | null; setUser:
   return <section className="account-page"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Синхронизация</p><h1>{user ? "Аккаунт подключён" : "Продолжай с любого устройства"}</h1>{user ? <div className="account-card"><span className="sync-dot">●</span><div><strong>{user.displayName}</strong><p>{user.telegram ? "Вход через Telegram" : `Логин: ${user.username}`}<br/>Прогресс автоматически сохраняется каждые несколько секунд.</p></div><button className="secondary" onClick={logout}>Выйти</button></div> : <div className="auth-box"><div className="auth-tabs"><button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>Войти</button><button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>Создать аккаунт</button></div><label>Логин<input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} /></label><label>Пароль<input type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} value={password} onChange={(e) => setPassword(e.target.value)} /></label>{error && <p className="inline-error">{error}</p>}<button className="primary" disabled={loading || username.length < 3 || password.length < 8} onClick={submit}>{loading ? "Подключаю…" : mode === "login" ? "Войти и загрузить прогресс" : "Создать и синхронизировать"}</button><p className="auth-note">Внутри Telegram вход произойдёт автоматически. Пароль там вводить не потребуется.</p></div>}</section>;
 }
 
-function Home({ done, navigate }: { done: number; navigate: (s: Screen, subject?: Subject) => void }) {
+function Home({ done, subject, selectSubject, navigate }: { done: number; subject: Subject; selectSubject: (subject: Subject) => void; navigate: (s: Screen, subject?: Subject) => void }) {
+  const bank = questionBanks.find((item) => item.id === subject.id);
+  const questionCount = bank?.sections.reduce((sum, section) => sum + section.questions.length, 0) || 0;
+  const latestLecture = Object.values(readStore<Record<string, LectureProgress>>("exam-lecture-progress", {}))
+    .sort((left, right) => (Date.parse(right.updatedAt) || 0) - (Date.parse(left.updatedAt) || 0))[0];
   return <>
     <section className="hero">
       <div><p className="eyebrow">Твоя подготовка</p><h1>Спокойно.<br/><em>Ты сдашь.</em></h1></div>
       <div className="hero-score"><strong>{done}</strong><span>подходов<br/>завершено</span></div>
     </section>
-    <section><div className="section-title"><h2>Предметы</h2><span>3 курса · 23 страницы</span></div>
+    <button className="home-continue" onClick={() => navigate(latestLecture ? "lectures" : "learn", subject)}>
+      <span>{latestLecture ? "Продолжить слушать" : "Начать подготовку"}</span>
+      <strong>{latestLecture?.title || subject.title}</strong>
+      <small>{latestLecture ? `${latestLecture.section} · ${Math.round(latestLecture.percent)}% прослушано` : `${questionCount} вопросов · ${bank?.sections.length || 0} разделов`}</small>
+      <b aria-hidden="true">→</b>
+    </button>
+    <section><div className="section-title"><h2>Предметы</h2><span>{subjects.length} курса · {subjects.reduce((sum, item) => sum + item.pages, 0)} страниц</span></div>
       <div className="subjects">{subjects.map((item, i) => { const bank = questionBanks.find((x) => x.id === item.id); const count = bank?.sections.reduce((sum, section) => sum + section.questions.length, 0) || 0; return <button className={`subject ${item.color}`} key={item.id} onClick={() => navigate("learn", item)}>
         <span className="subject-index">0{i + 1}</span><span className="subject-code">{item.short}</span><strong>{item.title}</strong><small>{count} вопросов · {bank?.tasks.length || 0} задач</small><span className="arrow">↗</span>
       </button>})}</div>
     </section>
     <section><div className="section-title"><h2>Режим</h2><span>выбери формат</span></div>
+      <div className="mode-subject-picker" aria-label="Предмет для режима">
+        <span>Сейчас изучаем</span>
+        <div>{subjects.map((item) => <button key={item.id} className={item.id === subject.id ? "active" : ""} aria-pressed={item.id === subject.id} onClick={() => selectSubject(item)}>{item.short}<small>{questionBanks.find((entry) => entry.id === item.id)?.sections.reduce((sum, section) => sum + section.questions.length, 0) || 0}</small></button>)}</div>
+      </div>
       <div className="modes">
-        <button onClick={() => navigate("learn", subjects[2])}><i>00</i><span><strong>Все темы</strong><small>198 вопросов · карточки</small></span><b>→</b></button>
-        <button onClick={() => navigate("quiz", subjects[2])}><i>01</i><span><strong>Быстрый тест</strong><small>8 вопросов · один ответ</small></span><b>→</b></button>
-        <button onClick={() => navigate("written", subjects[2])}><i>02</i><span><strong>Письменный ответ</strong><small>Проверка по критериям</small></span><b>→</b></button>
-        <button onClick={() => navigate("code", subjects[2])}><i>03</i><span><strong>Написать код</strong><small>Java · редактор на телефоне</small></span><b>→</b></button>
-        <button onClick={() => navigate("exam", subjects[2])}><i>04</i><span><strong>Полный билет</strong><small>60 минут · 100 баллов</small></span><b>→</b></button>
+        <button onClick={() => navigate("learn", subject)}><i>00</i><span><strong>Все темы</strong><small>{questionCount} вопросов · карточки</small></span><b>→</b></button>
+        <button onClick={() => navigate("quiz", subject)}><i>01</i><span><strong>Быстрый тест</strong><small>{Math.min(8, questionCount)} вопросов · один ответ</small></span><b>→</b></button>
+        <button onClick={() => navigate("written", subject)}><i>02</i><span><strong>Письменный ответ</strong><small>{questionCount} вопросов · проверка по критериям</small></span><b>→</b></button>
+        <button disabled={!bank?.tasks.length} onClick={() => navigate("code", subject)}><i>03</i><span><strong>Написать код</strong><small>{bank?.tasks.length ? `${bank.tasks.length} задач · редактор на телефоне` : "В этом предмете задач нет"}</small></span><b>→</b></button>
+        <button onClick={() => navigate("exam", subject)}><i>04</i><span><strong>Полный билет</strong><small>60 минут · 100 баллов</small></span><b>→</b></button>
         <button onClick={() => navigate("answers")}><i>05</i><span><strong>Эталонные ответы</strong><small>Ответы на 21–25 баллов</small></span><b>→</b></button>
         <button onClick={() => navigate("lectures")}><i>06</i><span><strong>Лекции</strong><small>Слушать ответы по темам в фоне</small></span><b>♫</b></button>
       </div>
@@ -106,9 +218,11 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const [subjectId, setSubjectId] = useState("all"); const [sectionId, setSectionId] = useState("all");
   const [index, setIndex] = useState(() => Number(localStorage.getItem("exam-lecture-index") || 0));
   const [audioUrl, setAudioUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [speed, setSpeed] = useState(1);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [repeatCurrent, setRepeatCurrent] = useState(() => localStorage.getItem("exam-lecture-repeat") === "true");
+  const [queueQuery, setQueueQuery] = useState(""); const [unlistenedOnly, setUnlistenedOnly] = useState(false);
   const [listeningProgress, setListeningProgress] = useState<Record<string, LectureProgress>>(() => readStore("exam-lecture-progress", {}));
-  const audioRef = useRef<HTMLAudioElement>(null); const urlRef = useRef(""); const loadedTrackRef = useRef<LectureTrack | null>(null); const loadVersionRef = useRef(0); const recordListeningRef = useRef<(force?: boolean) => void>(() => undefined); const lastProgressWrite = useRef(0); const lastMediaTime = useRef(0); const pendingRanges = useRef<ListeningRange[]>([]); const seeking = useRef(false);
+  const audioRef = useRef<HTMLAudioElement>(null); const activeRowRef = useRef<HTMLButtonElement>(null); const urlRef = useRef(""); const loadedTrackRef = useRef<LectureTrack | null>(null); const loadVersionRef = useRef(0); const recordListeningRef = useRef<(force?: boolean) => void>(() => undefined); const lastProgressWrite = useRef(0); const lastMediaTime = useRef(0); const pendingRanges = useRef<ListeningRange[]>([]); const seeking = useRef(false);
   const sections = subjectId === "all" ? [] : questionBanks.find((bank) => bank.id === subjectId)?.sections || [];
   const tracks = useMemo<LectureTrack[]>(() => {
     const banks = questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId);
@@ -141,8 +255,17 @@ function Lectures({ onBack }: { onBack: () => void }) {
   }, [lectureMode, subjectId, sectionId]);
   const sectionCount = new Set(tracks.map((track) => track.sectionKey)).size;
   const currentIndex = tracks.length ? index % tracks.length : 0; const current = tracks[currentIndex];
-  useEffect(() => { loadVersionRef.current += 1; recordListeningRef.current(true); audioRef.current?.pause(); loadedTrackRef.current = null; pendingRanges.current = []; setIndex(0); setAudioUrl(""); setLoading(false); setError(""); if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = ""; } }, [lectureMode, subjectId, sectionId]);
+  const visibleTracks = useMemo(() => {
+    const query = queueQuery.trim().toLocaleLowerCase("ru-RU");
+    return tracks.map((track, originalIndex) => ({ track, originalIndex })).filter(({ track }) => {
+      if (unlistenedOnly && listeningProgress[track.id]?.completed) return false;
+      if (!query) return true;
+      return [track.subject, track.section, track.title, ...(track.topics || [])].join(" ").toLocaleLowerCase("ru-RU").includes(query);
+    });
+  }, [tracks, queueQuery, unlistenedOnly, listeningProgress]);
+  useEffect(() => { loadVersionRef.current += 1; recordListeningRef.current(true); audioRef.current?.pause(); loadedTrackRef.current = null; pendingRanges.current = []; setIndex(0); setAudioUrl(""); setIsPlaying(false); setLoading(false); setError(""); if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = ""; } }, [lectureMode, subjectId, sectionId]);
   useEffect(() => () => { loadVersionRef.current += 1; recordListeningRef.current(true); if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
+  useEffect(() => { activeRowRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" }); }, [current?.id, queueQuery, unlistenedOnly]);
   const requestBody = (track: LectureTrack) => ({ title: track.mode === "section" ? track.section : track.title, mode: track.mode, topics: track.topics });
   const cacheLocation = (track: LectureTrack) => {
     const version = "v4";
@@ -185,6 +308,12 @@ function Lectures({ onBack }: { onBack: () => void }) {
   };
   recordListeningRef.current = recordListening;
   const move = (delta: number) => { if (!tracks.length) return; recordListening(true); load((currentIndex + delta + tracks.length) % tracks.length); };
+  const togglePlayback = () => {
+    const audio = audioRef.current;
+    if (!audio || !audioUrl) { load(currentIndex); return; }
+    if (audio.paused) audio.play().catch(() => null);
+    else audio.pause();
+  };
   const toggleRepeat = () => setRepeatCurrent((enabled) => {
     const next = !enabled;
     localStorage.setItem("exam-lecture-repeat", String(next));
@@ -209,15 +338,30 @@ function Lectures({ onBack }: { onBack: () => void }) {
       <label>Предмет<select value={subjectId} onChange={(e) => { loadVersionRef.current += 1; setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
       <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => { loadVersionRef.current += 1; setSectionId(e.target.value); }}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
     </div>
-    {current && <div className="lecture-player">
+    {current && <div className="lecture-player" aria-busy={loading}>
       <div className="lecture-number">{currentIndex + 1} / {tracks.length}</div><small>{current.subject} · {current.section}</small><h2>{current.title}</h2>
       {current.mode === "section" && <p className="lecture-coverage">Часть {current.part} из {current.partCount} · {current.topics?.length || 0} полных ответа · части включаются автоматически</p>}
       {currentProgress && <p className={`lecture-listened ${currentProgress.completed ? "completed" : ""}`}>{currentProgress.completed ? "✓ Засчитано" : `Прослушано ${Math.round(currentProgress.percent)}%`} · засчитывается после 50%</p>}
-      {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : currentProgress?.completed ? "▶ Прослушать ещё раз" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline loop={repeatCurrent} onPlay={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null); }} onSeeking={() => { seeking.current = true; if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; }} onSeeked={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; seeking.current = false; }} onTimeUpdate={() => recordListening()} onPause={() => recordListening(true)} onEnded={() => { recordListening(true); if (!repeatCurrent) move(1); }} onLoadedMetadata={() => { if (!audioRef.current) return; audioRef.current.playbackRate = speed; const loadedTrack = loadedTrackRef.current; const saved = loadedTrack ? readStore<Record<string, LectureProgress>>("exam-lecture-progress", {})[loadedTrack.id] : null; const position = saved?.positionSeconds ?? 0; if (saved && !saved.completed && position > 0 && position < audioRef.current.duration * .95) audioRef.current.currentTime = position; lastMediaTime.current = audioRef.current.currentTime; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button className={repeatCurrent ? "active" : ""} aria-pressed={repeatCurrent} onClick={toggleRepeat}>↻ {repeatCurrent ? "Повтор включён" : "На повтор"}</button><button onClick={() => move(1)}>Следующая →</button></div></>}
-      {loading && audioUrl && <p className="lecture-loading">Готовлю следующий трек…</p>}{error && <p className="inline-error">{error}</p>}
+      {!audioUrl ? <button className="lecture-start" disabled={loading} onClick={() => load(currentIndex)}>{loading ? "Готовлю лекцию…" : currentProgress?.completed ? "▶ Прослушать ещё раз" : "▶ Начать слушать"}</button> : <><audio ref={audioRef} src={audioUrl} controls playsInline loop={repeatCurrent} onPlay={() => { setIsPlaying(true); if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; prefetch(tracks[(currentIndex + 1) % tracks.length]).catch(() => null); }} onSeeking={() => { seeking.current = true; if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; }} onSeeked={() => { if (audioRef.current) lastMediaTime.current = audioRef.current.currentTime; seeking.current = false; }} onTimeUpdate={() => recordListening()} onPause={() => { setIsPlaying(false); recordListening(true); }} onEnded={() => { setIsPlaying(false); recordListening(true); if (!repeatCurrent) move(1); }} onLoadedMetadata={() => { if (!audioRef.current) return; audioRef.current.playbackRate = speed; const loadedTrack = loadedTrackRef.current; const saved = loadedTrack ? readStore<Record<string, LectureProgress>>("exam-lecture-progress", {})[loadedTrack.id] : null; const position = saved?.positionSeconds ?? 0; if (saved && !saved.completed && position > 0 && position < audioRef.current.duration * .95) audioRef.current.currentTime = position; lastMediaTime.current = audioRef.current.currentTime; }} /><div className="lecture-controls"><button onClick={() => move(-1)}>← Предыдущая</button><label>Скорость<select value={speed} onChange={(e) => { const value = Number(e.target.value); setSpeed(value); if (audioRef.current) audioRef.current.playbackRate = value; }}><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button className={repeatCurrent ? "active" : ""} aria-pressed={repeatCurrent} onClick={toggleRepeat}>↻ {repeatCurrent ? "Повтор включён" : "На повтор"}</button><button onClick={() => move(1)}>Следующая →</button></div></>}
+      {loading && <p className="lecture-loading" role="status" aria-live="polite">{audioUrl ? "Готовлю следующий трек…" : "Загружаю аудио…"}</p>}{error && <p className="inline-error" role="alert" aria-live="assertive">{error}</p>}
     </div>}
     {current && <LectureFollowUps track={current}/>}
-    <div className="lecture-queue"><div className="section-title"><h2>{lectureMode === "questions" ? "Все вопросы" : "Полные лекции по разделам"}</h2><span>{lectureMode === "questions" ? `${tracks.length} вопросов` : `${sectionCount} разделов · ${tracks.length} частей`}</span></div><div className="lecture-queue-list">{tracks.map((track, trackIndex) => { const progress = listeningProgress[track.id]; return <button className={`${trackIndex === currentIndex ? "active " : ""}${progress?.completed ? "listened" : ""}`} key={track.id} onClick={() => { recordListening(true); load(trackIndex); }}><span>{progress?.completed ? "✓" : trackIndex + 1}</span><div><small>{track.subject} · {track.section}</small><strong>{track.title}</strong>{track.mode === "section" && <em>{track.topics?.length || 0} вопроса: сначала формулировка, затем полный ответ</em>}{progress && !progress.completed && <em>Прослушано {Math.round(progress.percent)}%</em>}</div></button>; })}</div></div>
+    {current && audioUrl && <aside className="lecture-mini-player" aria-label="Компактный плеер">
+      <div><small>{current.section}</small><strong>{current.title}</strong><span>{Math.round(currentProgress?.percent || 0)}%</span></div>
+      <button onClick={togglePlayback} aria-label={isPlaying ? "Поставить на паузу" : "Продолжить воспроизведение"}>{isPlaying ? "Ⅱ" : "▶"}</button>
+      <button onClick={() => move(1)} aria-label="Следующая лекция">→</button>
+      <button className={repeatCurrent ? "active" : ""} aria-pressed={repeatCurrent} aria-label={repeatCurrent ? "Отключить повтор" : "Включить повтор"} onClick={toggleRepeat}>↻</button>
+    </aside>}
+    <div className="lecture-queue"><div className="section-title"><h2>{lectureMode === "questions" ? "Все вопросы" : "Полные лекции по разделам"}</h2><span>{lectureMode === "questions" ? `${tracks.length} вопросов` : `${sectionCount} разделов · ${tracks.length} частей`}</span></div>
+      <div className="lecture-queue-tools"><input type="search" value={queueQuery} onChange={(event) => setQueueQuery(event.target.value)} placeholder="Найти вопрос или раздел…" aria-label="Поиск по очереди лекций"/><button className={unlistenedOnly ? "active" : ""} aria-pressed={unlistenedOnly} onClick={() => setUnlistenedOnly((enabled) => !enabled)}>○ Только непрослушанные</button></div>
+      <div className="lecture-queue-list">{visibleTracks.length > 0 ? visibleTracks.flatMap(({ track, originalIndex }, visibleIndex) => {
+        const progress = listeningProgress[track.id];
+        const previousTrack = visibleTracks[visibleIndex - 1]?.track;
+        const row = <button ref={originalIndex === currentIndex ? activeRowRef : undefined} aria-current={originalIndex === currentIndex ? "true" : undefined} className={`${originalIndex === currentIndex ? "active " : ""}${progress?.completed ? "listened" : ""}`} key={track.id} onClick={() => { recordListening(true); load(originalIndex); }}><span>{progress?.completed ? "✓" : originalIndex + 1}</span><div><small>{track.subject} · {track.section}</small><strong>{track.title}</strong>{track.mode === "section" && <em>{track.topics?.length || 0} вопроса: сначала формулировка, затем полный ответ</em>}{progress && !progress.completed && <em>Прослушано {Math.round(progress.percent)}%</em>}</div></button>;
+        if (previousTrack?.sectionKey === track.sectionKey) return [row];
+        return [<div className="lecture-section-divider" key={`section-${track.sectionKey}`}><span>{track.subject}</span><strong>{track.section}</strong></div>, row];
+      }) : <div className="empty lecture-queue-empty" role="status">{queueQuery.trim() || unlistenedOnly ? "По выбранным фильтрам ничего не найдено." : "В этой подборке пока нет лекций."}</div>}</div>
+    </div>
   </section>;
 }
 
@@ -260,17 +404,20 @@ function LectureFollowUps({ track }: { track: LectureTrack }) {
       setItems(next); localStorage.setItem(storageKey, JSON.stringify(next)); setQuestion(""); syncProgress();
     } catch (e: any) { if (e?.name !== "AbortError" && requestRef.current === controller) setError(e.message || "Уточнение сейчас недоступно"); } finally { if (requestRef.current === controller) { requestRef.current = null; setLoading(false); } }
   };
-  return <section className="lecture-followups">
-    <p className="eyebrow">Разобраться глубже</p><h3>Задать уточнение к вопросу</h3>
+  return <details className="lecture-followups">
+    <summary><span><small>Разобраться глубже</small><strong>Задать уточнение к вопросу</strong></span><b>{currentItems.length > 0 ? `${currentItems.length} сохранено` : "Открыть"}</b></summary>
+    <div className="lecture-followups-body">
     {track.mode === "section" && topics.length > 0 && <label className="followup-topic">К какому вопросу<select value={topicIndex} onChange={(event) => setTopicIndex(Number(event.target.value))}>{topics.map((topic, index) => <option value={index} key={`${track.id}-${index}`}>{index + 1}. {topic}</option>)}</select></label>}
     <div className="followup-context"><span>Исходный вопрос</span><strong>{originalQuestion}</strong></div>
     <textarea value={question} disabled={loading} onChange={(event) => setQuestion(event.target.value)} placeholder="Например: чем это отличается от переопределения?" maxLength={2000}/>
-    {error && <p className="inline-error">{error}</p>}
+    {error && <p className="inline-error" role="alert" aria-live="assertive">{error}</p>}
     <button className="followup-submit" disabled={loading || question.trim().length < 3} onClick={ask}>{loading ? "Ищу точный ответ…" : "Получить текстовый ответ"}</button>
+    {loading && <p className="followup-status" role="status" aria-live="polite">Формирую текстовый ответ…</p>}
     <small className="followup-note">Ответ сохранится в аккаунте и останется доступен позже. Аудио для уточнений не создаётся.</small>
-    {currentItems.length > 0 && <div className="followup-current"><h4>Уточнения к этому треку</h4>{currentItems.map((item) => <article className="followup-card" key={item.id}><small>{item.originalQuestion}</small><strong>Ты: {item.question}</strong><p>{item.answer}</p><time>{new Date(item.createdAt).toLocaleString("ru-RU")}</time></article>)}</div>}
+    {currentItems.length > 0 && <div className="followup-current" aria-live="polite"><h4>Уточнения к этому треку</h4>{currentItems.map((item) => <article className="followup-card" key={item.id}><small>{item.originalQuestion}</small><strong>Ты: {item.question}</strong><p>{item.answer}</p><time>{new Date(item.createdAt).toLocaleString("ru-RU")}</time></article>)}</div>}
     {items.length > 0 && <details className="saved-followups"><summary>Все сохранённые уточнения ({items.length})</summary><div>{items.map((item) => <article className="followup-card" key={`saved-${item.id}`}><small>{item.subject} · {item.section}</small><strong>{item.question}</strong><p>{item.answer}</p><time>{new Date(item.createdAt).toLocaleString("ru-RU")}</time></article>)}</div></details>}
-  </section>;
+    </div>
+  </details>;
 }
 
 function Learn({ subject, onBack }: { subject: Subject; onBack: () => void }) {
@@ -349,34 +496,53 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
     <button className="primary" disabled={answer.trim().length < 20 || loading} onClick={check}>{loading ? "Проверяю…" : "Проверить ответ"}</button>{result && <button className="secondary" onClick={next}>Следующий вопрос →</button>}</section>;
 }
 
-function CodeTask({ onBack }: { onBack: () => void }) {
+function CodeTask({ subject, onBack }: { subject: Subject; onBack: () => void }) {
   const initial = `public class Main {\n  public static void main(String[] args) {\n    // твоё решение\n    \n  }\n}`;
-  const allTasks = questionBanks.find((bank) => bank.id === "java")?.tasks.map((text, i) => ({ id: `full-${i}`, title: `Задача ${i + 1}`, text })) || codeTasks;
-  const [taskIndex, setTaskIndex] = useState(0); const task = allTasks[taskIndex % allTasks.length];
+  const allTasks = questionBanks.find((bank) => bank.id === subject.id)?.tasks.map((text, i) => ({ id: subject.id === "java" ? `full-${i}` : `${subject.id}-${i}`, title: `Задача ${i + 1}`, text })) || codeTasks;
+  const [taskIndex, setTaskIndex] = useState(0); const task = allTasks.length ? allTasks[taskIndex % allTasks.length] : null;
   const [progress, setProgress] = useState<Record<string, TaskProgress>>(() => readStore("exam-task-progress", {}));
-  const [code, setCode] = useState(() => progress[allTasks[0].id]?.code || localStorage.getItem("exam-code") || initial); const [message, setMessage] = useState(""); const [grade, setGrade] = useState<any>(null); const [loading, setLoading] = useState(false);
-  const insert = (token: string) => setCode((value) => value + token);
+  const [code, setCode] = useState(() => (allTasks[0] && progress[allTasks[0].id]?.code) || localStorage.getItem("exam-code") || initial); const [message, setMessage] = useState(""); const [grade, setGrade] = useState<any>(null); const [loading, setLoading] = useState(false);
+  const codeRef = useRef<HTMLTextAreaElement>(null);
+  const insert = (token: string) => {
+    const editor = codeRef.current;
+    const start = editor?.selectionStart ?? code.length;
+    const end = editor?.selectionEnd ?? start;
+    setCode(`${code.slice(0, start)}${token}${code.slice(end)}`);
+    window.requestAnimationFrame(() => {
+      editor?.focus();
+      editor?.setSelectionRange(start + token.length, start + token.length);
+    });
+  };
+  if (!task) return <section className="task-page code-page"><button className="back" onClick={onBack}>← Выйти</button><div className="empty"><strong>Для этого предмета задач с кодом нет</strong><p>Выбери «Интеллектуальные системы» или «Java-инженерию» на главной.</p></div></section>;
   const selectTask = (index: number) => { const selected = allTasks[index]; setTaskIndex(index); setCode(progress[selected.id]?.code || initial); setGrade(progress[selected.id] ? { score: progress[selected.id].score, level: progress[selected.id].level, summary: "Сохранённый результат", complexity: "Открой проверку снова для нового анализа.", hint: "Можно улучшить решение и перепроверить." } : null); setMessage(""); };
   const check = async () => { setLoading(true); setGrade(null); let compiler = "не запускался"; try { const compileResponse = await fetch("/api/java/compile", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) }); const compileBody = await compileResponse.json(); compiler = compileBody.output || compileBody.error; setMessage(compiler); const gradeResponse = await fetch("/api/grade/code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: task.text, code, compiler }) }); const body = await gradeResponse.json(); if (!gradeResponse.ok) throw new Error(body.error); setGrade(body); const item = { id: task.id, task: task.text, code, score: body.score, level: body.level, completed: body.score >= 31, updatedAt: new Date().toISOString() }; const nextProgress = { ...progress, [task.id]: item }; setProgress(nextProgress); localStorage.setItem("exam-task-progress", JSON.stringify(nextProgress)); } catch (e: any) { setMessage(e.message || "Проверка недоступна"); } finally { setLoading(false); } };
   const next = () => selectTask((taskIndex + 1) % allTasks.length);
   const completed = Object.values(progress).filter((item) => item.completed).length;
-  return <section className="task-page code-page"><button className="back" onClick={onBack}>← Выйти</button><div className="task-meta"><span>JAVA</span><b>Выполнено {completed}/{allTasks.length}</b><span>до 50 баллов</span></div><select className="task-select" value={taskIndex} onChange={(e) => selectTask(Number(e.target.value))}>{allTasks.map((item, i) => <option value={i} key={item.id}>{progress[item.id]?.completed ? "✓" : progress[item.id] ? "•" : "○"} {item.title} {progress[item.id] ? `— ${progress[item.id].score}/50` : ""}</option>)}</select><p className="eyebrow">{task.title} · из программы</p><h2 className="question small">{task.text}</h2><div className="code-toolbar"><span>Main.java</span><b>Java 17</b></div><textarea className="code-editor" spellCheck={false} value={code} onChange={(e) => setCode(e.target.value)} />
+  return <section className="task-page code-page"><button className="back" onClick={onBack}>← Выйти</button><div className="task-meta"><span>{subject.short}</span><b>Выполнено {completed}/{allTasks.length}</b><span>до 50 баллов</span></div><select className="task-select" value={taskIndex} onChange={(e) => selectTask(Number(e.target.value))}>{allTasks.map((item, i) => <option value={i} key={item.id}>{progress[item.id]?.completed ? "✓" : progress[item.id] ? "•" : "○"} {item.title} {progress[item.id] ? `— ${progress[item.id].score}/50` : ""}</option>)}</select><p className="eyebrow">{task.title} · из программы</p><h2 className="question small">{task.text}</h2><div className="code-toolbar"><span>Main.java</span><b>Java 17</b></div><textarea ref={codeRef} className="code-editor" spellCheck={false} value={code} onChange={(e) => setCode(e.target.value)} />
     <div className="key-row">{brackets.map((key) => <button key={key} onClick={() => insert(key)}>{key}</button>)}</div>{message && <div className="console">{message}</div>}
     {grade && <div className="feedback"><span>{grade.level}</span><strong>{grade.score} / 50 баллов</strong><p>{grade.summary}</p><h4>Сложность</h4><p>{grade.complexity}</p><h4>Подсказка</h4><p>{grade.hint}</p>{grade.issues?.length > 0 && <ul>{grade.issues.map((x: string) => <li key={x}>{x}</li>)}</ul>}</div>}
     <button className="primary" disabled={loading || code.trim().length < 20} onClick={check}>{loading ? "Проверяю…" : "▶ Проверить решение"}</button>{grade && <button className="secondary" onClick={next}>Следующая задача →</button>}</section>;
 }
 
-function Stats({ done, onBack }: { done: number; onBack: () => void }) {
+function Stats({ done, onBack, onOpenSubject }: { done: number; onBack: () => void; onOpenSubject: (subject: Subject) => void }) {
   const taskProgress = readStore<Record<string, TaskProgress>>("exam-task-progress", {}); const completedTasks = Object.values(taskProgress).filter((item) => item.completed).length; const references = Object.keys(readStore("exam-reference-answers", {})).length;
   const lectureProgress = readStore<Record<string, LectureProgress>>("exam-lecture-progress", {}); const completedLectures = Object.values(lectureProgress).filter((item) => item.completed).length; const listenedMinutes = Math.round(Object.values(lectureProgress).reduce((sum, item) => sum + item.listenedSeconds, 0) / 60);
-  return <section className="task-page stats-page"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Прогресс</p><h1 className="stats-title">{done} <span>тестов завершено</span></h1><div className="stats-summary"><span><b>{completedTasks}</b> из 15 задач</span><span><b>{references}</b> эталонов</span><span><b>{completedLectures}</b> аудио засчитано<br/>{listenedMinutes} минут</span><span><b>{localStorage.getItem("exam-last-score") || "—"}</b> последний билет</span></div><div className="stats-subjects">{questionBanks.map((bank) => { const known = readStore<string[]>(`exam-known-${bank.id}`, []); const total = bank.sections.reduce((sum, section) => sum + section.questions.length, 0); const totalAudio = total + bank.sections.reduce((sum, section) => sum + Math.ceil(section.questions.length / 3), 0); const completedAudio = Object.values(lectureProgress).filter((item) => item.completed && (item.id.startsWith(`question-${bank.id}-`) || item.id.startsWith(`full-section-${bank.id}-`))).length; return <div key={bank.id}><h2>{bank.title}</h2><strong>{Math.round(known.length / total * 100)}%</strong><div className="learn-progress"><i style={{ width: `${known.length / total * 100}%` }}/></div><p className="audio-stat"><span>♫ Прослушано аудио</span><b>{completedAudio}/{totalAudio}</b></p>{bank.sections.map((section, sectionIndex) => { const count = section.questions.filter((_q, i) => known.includes(`${sectionIndex}-${i}`)).length; return <p key={section.title}><span>{section.title}</span><b>{count}/{section.questions.length}</b></p>})}</div>})}</div></section>;
+  return <section className="task-page stats-page"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Прогресс</p><h1 className="stats-title">{done} <span>тестов завершено</span></h1><div className="stats-summary"><span><b>{completedTasks}</b> из 15 задач</span><span><b>{references}</b> эталонов</span><span><b>{completedLectures}</b> аудио засчитано<br/>{listenedMinutes} минут</span><span><b>{localStorage.getItem("exam-last-score") || "—"}</b> последний билет</span></div><div className="stats-subjects">{questionBanks.map((bank) => { const known = readStore<string[]>(`exam-known-${bank.id}`, []); const total = bank.sections.reduce((sum, section) => sum + section.questions.length, 0); const totalAudio = total + bank.sections.reduce((sum, section) => sum + Math.ceil(section.questions.length / 3), 0); const completedAudio = Object.values(lectureProgress).filter((item) => item.completed && (item.id.startsWith(`question-${bank.id}-`) || item.id.startsWith(`full-section-${bank.id}-`))).length; const open = () => { const selected = findSubject(bank.id); if (selected) onOpenSubject(selected); }; return <div role="button" tabIndex={0} aria-label={`Открыть темы: ${bank.title}`} key={bank.id} onClick={open} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } }}><h2>{bank.title}</h2><strong>{Math.round(known.length / total * 100)}%</strong><div className="learn-progress"><i style={{ width: `${known.length / total * 100}%` }}/></div><p className="audio-stat"><span>♫ Прослушано аудио</span><b>{completedAudio}/{totalAudio}</b></p>{bank.sections.map((section, sectionIndex) => { const count = section.questions.filter((_q, i) => known.includes(`${sectionIndex}-${i}`)).length; return <p key={section.title}><span>{section.title}</span><b>{count}/{section.questions.length}</b></p>})}<span className="stats-open">Открыть темы →</span></div>})}</div></section>;
 }
 
 function AnswerLibrary({ onBack }: { onBack: () => void }) {
   const [subjectId, setSubjectId] = useState("java"); const [query, setQuery] = useState(""); const [saved, setSaved] = useState<Record<string, SavedReference>>(() => readStore("exam-reference-answers", {})); const [selectedId, setSelectedId] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState("");
+  const answerRef = useRef<HTMLElement>(null);
   const bank = questionBanks.find((item) => item.id === subjectId)!; const items = bank.sections.flatMap((section, sectionIndex) => section.questions.map((question, questionIndex) => ({ id: `${subjectId}:${sectionIndex}-${questionIndex}`, section: section.title, question }))).filter((item) => item.question.toLowerCase().includes(query.toLowerCase())); const selected = items.find((item) => item.id === selectedId) || items[0]; const reference = selected ? saved[selected.id] : null;
+  const chooseAnswer = (id: string) => {
+    setSelectedId(id);
+    if (window.matchMedia("(max-width: 760px)").matches) window.requestAnimationFrame(() => {
+      answerRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      answerRef.current?.focus({ preventScroll: true });
+    });
+  };
   const generate = async () => { if (!selected) return; setLoading(true); setError(""); try { const response = await fetch("/api/reference-answer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: selected.question }) }); const body = await response.json(); if (!response.ok) throw new Error(body.error); const item = { id: selected.id, subject: bank.title, section: selected.section, question: selected.question, answer: body.answer, keyPoints: body.keyPoints, savedAt: new Date().toISOString() }; saveReference(item); const next = { ...saved, [item.id]: item }; setSaved(next); } catch (e: any) { setError(e.message || "Не удалось получить ответ"); } finally { setLoading(false); } };
-  return <section className="answer-library"><button className="back" onClick={onBack}>← На главную</button><div className="learn-head"><div><p className="eyebrow">Библиотека</p><h1>Ответы на максимальный балл</h1></div><div className="learn-total"><b>{Object.keys(saved).length}</b><span>ответов<br/>сохранено</span></div></div><div className="library-controls"><select value={subjectId} onChange={(e) => { setSubjectId(e.target.value); setSelectedId(""); }}><option value="management">Цифровое производство</option><option value="systems">Интеллектуальные системы</option><option value="java">Java-инженерия</option></select><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Найти вопрос…"/></div><div className="library-layout"><aside>{items.map((item, i) => <button className={(selected?.id === item.id ? "selected " : "") + (saved[item.id] ? "saved" : "")} key={item.id} onClick={() => setSelectedId(item.id)}><span>{saved[item.id] ? "★" : String(i + 1)}</span><div><small>{item.section}</small>{item.question}</div></button>)}</aside><article>{selected && <><p className="eyebrow">{selected.section}</p><h2>{selected.question}</h2>{reference ? <div className="reference-full"><span>Эталон · 21–25 баллов</span><p>{reference.answer}</p><h3>Ключевые пункты</h3><ul>{reference.keyPoints.map((point) => <li key={point}>{point}</li>)}</ul></div> : <div className="reference-empty"><p>Эталон для этого вопроса ещё не создан. Он будет сохранён на устройстве после первого запроса.</p><button className="primary" disabled={loading} onClick={generate}>{loading ? "Готовлю ответ…" : "Создать эталонный ответ"}</button></div>}{error && <p className="inline-error">{error}</p>}</>}</article></div></section>;
+  return <section className="answer-library"><button className="back" onClick={onBack}>← На главную</button><div className="learn-head"><div><p className="eyebrow">Библиотека</p><h1>Ответы на максимальный балл</h1></div><div className="learn-total"><b>{Object.keys(saved).length}</b><span>ответов<br/>сохранено</span></div></div><div className="library-controls"><select value={subjectId} onChange={(e) => { setSubjectId(e.target.value); setSelectedId(""); }}><option value="management">Цифровое производство</option><option value="systems">Интеллектуальные системы</option><option value="java">Java-инженерия</option></select><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Найти вопрос…"/></div><div className="library-layout"><aside>{items.map((item, i) => <button className={(selected?.id === item.id ? "selected " : "") + (saved[item.id] ? "saved" : "")} key={item.id} onClick={() => chooseAnswer(item.id)}><span>{saved[item.id] ? "★" : String(i + 1)}</span><div><small>{item.section}</small>{item.question}</div></button>)}</aside><article ref={answerRef} tabIndex={-1}>{selected && <><p className="eyebrow">{selected.section}</p><h2>{selected.question}</h2>{reference ? <div className="reference-full"><span>Эталон · 21–25 баллов</span><p>{reference.answer}</p><h3>Ключевые пункты</h3><ul>{reference.keyPoints.map((point) => <li key={point}>{point}</li>)}</ul></div> : <div className="reference-empty"><p>Эталон для этого вопроса ещё не создан. Он будет сохранён на устройстве после первого запроса.</p><button className="primary" disabled={loading} onClick={generate}>{loading ? "Готовлю ответ…" : "Создать эталонный ответ"}</button></div>}{error && <p className="inline-error">{error}</p>}</>}</article></div></section>;
 }
 
 function Exam({ subject, onBack }: { subject: Subject; onBack: () => void }) {
