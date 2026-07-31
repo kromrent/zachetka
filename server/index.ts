@@ -169,23 +169,55 @@ app.get("/api/progress", authRequired, async (_request, response) => { const row
 app.put("/api/progress", authRequired, async (request, response) => {
   const parsed = z.record(z.string(), z.unknown()).safeParse(request.body);
   if (!parsed.success || JSON.stringify(parsed.data).length > 1_000_000) return response.status(400).json({ error: "Некорректный прогресс" });
-  const current = (await database.query<{ payload: Record<string, unknown> }>("SELECT payload FROM progress WHERE user_id=$1", [response.locals.user.id])).rows[0]?.payload || {};
-  const merged = { ...current, ...parsed.data };
-  // Follow-ups are append-only. Merge them by id so a second open device with
-  // an older snapshot cannot erase an answer saved from the phone.
-  const readFollowUps = (value: unknown) => {
-    try {
-      const result = typeof value === "string" ? JSON.parse(value) : value;
-      return Array.isArray(result) ? result.filter((item) => item && typeof item === "object" && typeof item.id === "string") : [];
-    } catch { return []; }
-  };
-  const followUps = [...readFollowUps(current["exam-lecture-followups"]), ...readFollowUps(parsed.data["exam-lecture-followups"])];
-  if (followUps.length) {
-    const unique = Array.from(new Map(followUps.map((item) => [item.id, item])).values()).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-    merged["exam-lecture-followups"] = JSON.stringify(unique);
+  const connection = await database.connect();
+  try {
+    await connection.query("BEGIN");
+    // The user row always exists, even if an older account somehow has no
+    // progress row yet. Locking it serializes all progress writes for that
+    // account before the upsert below and prevents cross-device lost updates.
+    await connection.query("SELECT id FROM users WHERE id=$1 FOR UPDATE", [response.locals.user.id]);
+    const current = (await connection.query<{ payload: Record<string, unknown> }>("SELECT payload FROM progress WHERE user_id=$1 FOR UPDATE", [response.locals.user.id])).rows[0]?.payload || {};
+    const merged = { ...current, ...parsed.data };
+    // Follow-ups are append-only. Merge them by id so a second open device with
+    // an older snapshot cannot erase an answer saved from the phone.
+    const readFollowUps = (value: unknown) => {
+      try {
+        const result = typeof value === "string" ? JSON.parse(value) : value;
+        return Array.isArray(result) ? result.filter((item) => item && typeof item === "object" && typeof item.id === "string") : [];
+      } catch { return []; }
+    };
+    const followUps = [...readFollowUps(current["exam-lecture-followups"]), ...readFollowUps(parsed.data["exam-lecture-followups"])];
+    if (followUps.length) {
+      const unique = Array.from(new Map(followUps.map((item) => [item.id, item])).values()).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+      merged["exam-lecture-followups"] = JSON.stringify(unique);
+    }
+
+    // Notes are editable, so merge each question independently and keep the
+    // newest timestamp. Empty records are intentional deletion tombstones.
+    const readQuestionNotes = (value: unknown) => {
+      try {
+        const result = typeof value === "string" ? JSON.parse(value) : value;
+        if (!result || typeof result !== "object" || Array.isArray(result)) return {} as Record<string, Record<string, unknown>>;
+        return Object.fromEntries(Object.entries(result).filter(([, note]) => note && typeof note === "object" && !Array.isArray(note) && typeof (note as { text?: unknown }).text === "string")) as Record<string, Record<string, unknown>>;
+      } catch { return {} as Record<string, Record<string, unknown>>; }
+    };
+    const questionNotes = readQuestionNotes(current["exam-question-notes"]);
+    for (const [questionKey, note] of Object.entries(readQuestionNotes(parsed.data["exam-question-notes"]))) {
+      const savedAt = Date.parse(String(questionNotes[questionKey]?.updatedAt || "")) || 0;
+      const candidateAt = Date.parse(String(note.updatedAt || "")) || 0;
+      if (!questionNotes[questionKey] || candidateAt >= savedAt) questionNotes[questionKey] = note;
+    }
+    if (Object.keys(questionNotes).length) merged["exam-question-notes"] = JSON.stringify(questionNotes);
+
+    await connection.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, merged]);
+    await connection.query("COMMIT");
+    response.json({ ok: true });
+  } catch (error) {
+    await connection.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release();
   }
-  await database.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, merged]);
-  response.json({ ok: true });
 });
 
 const WrittenGrade = z.object({
@@ -327,7 +359,7 @@ app.get("/api/status", (_request, response) => response.json({
   model: client ? model : null,
   lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed, maxCharactersPerPart: lectureSpeechChunkMaxCharacters },
   lectureText: { transcriptionModel: lectureTranscribeModel },
-  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true }
+  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true, questionNotes: true, writtenRetry: true }
 }));
 
 app.post("/api/grade/written", authRequired, async (request, response) => {

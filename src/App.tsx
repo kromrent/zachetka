@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { codeTasks, demoQuestions, subjects, writtenQuestions, type Question, type Subject } from "./data";
 import questionBankData from "./question-bank.json";
 import { addListenedRange, migrateLegacyRanges, totalUniqueSeconds, type ListeningRange } from "./listening-progress";
+import { mergeQuestionNotesValues, QUESTION_NOTES_OWNER_KEY, QUESTION_NOTES_STORAGE_KEY, QuestionNotes } from "./QuestionNotes";
 
 type Bank = { id: string; title: string; sections: { title: string; questions: string[] }[]; tasks: string[] };
 const questionBanks = questionBankData as Bank[];
@@ -68,9 +69,22 @@ function App() {
   useEffect(() => {
     if (!user) return;
     const marker = `zachetka-synced-${user.id}`;
-    if (!sessionStorage.getItem(marker)) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
+    const userId = String(user.id);
+    const notesOwner = localStorage.getItem(QUESTION_NOTES_OWNER_KEY);
+    const mayImportLocalNotes = !notesOwner || notesOwner === userId;
+    // localStorage is shared by every login in this browser. Do not import a
+    // previous account's personal notes when somebody else signs in.
+    if (!mayImportLocalNotes) localStorage.removeItem(QUESTION_NOTES_STORAGE_KEY);
+    localStorage.setItem(QUESTION_NOTES_OWNER_KEY, userId);
+    if (!sessionStorage.getItem(marker) || !mayImportLocalNotes) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
       sessionStorage.setItem(marker, "1");
-      if (remote.data && Object.keys(remote.data).length) { Object.entries(remote.data).forEach(([key, value]) => typeof value === "string" && localStorage.setItem(key, value)); window.location.reload(); }
+      if (remote.data && Object.keys(remote.data).length) {
+        const localNotes = mayImportLocalNotes ? localStorage.getItem(QUESTION_NOTES_STORAGE_KEY) : null;
+        const remoteNotes = remote.data[QUESTION_NOTES_STORAGE_KEY];
+        Object.entries(remote.data).forEach(([key, value]) => typeof value === "string" && localStorage.setItem(key, value));
+        if (localNotes || remoteNotes) localStorage.setItem(QUESTION_NOTES_STORAGE_KEY, mergeQuestionNotesValues(remoteNotes, localNotes));
+        window.location.reload();
+      }
       else await syncProgress();
     }).catch(() => null);
     const timer = window.setInterval(syncProgress, 5000);
@@ -212,7 +226,7 @@ function Home({ done, subject, selectSubject, navigate }: { done: number; subjec
   </>;
 }
 
-type LectureTrack = { id: string; subject: string; section: string; sectionKey: string; title: string; mode: "question" | "section"; topics?: string[]; part?: number; partCount?: number };
+type LectureTrack = { id: string; subject: string; section: string; sectionKey: string; title: string; mode: "question" | "section"; questionKeys: string[]; topics?: string[]; part?: number; partCount?: number };
 function Lectures({ onBack }: { onBack: () => void }) {
   type LectureTextEntry = { text?: string; source?: "generated" | "transcribed" | "cache"; loading: boolean; error?: string };
   const [lectureMode, setLectureMode] = useState<"questions" | "sections">("questions");
@@ -243,6 +257,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
         title: `${section.title} · часть ${partIndex + 1} из ${parts.length}`,
         mode: "section" as const,
         topics,
+        questionKeys: topics.map((_, topicIndex) => `${bank.id}:${sectionIndex}-${partIndex * questionsPerPart + topicIndex}`),
         part: partIndex + 1,
         partCount: parts.length
       }));
@@ -255,6 +270,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
         section: section.title,
         sectionKey: `${bank.id}-${sectionIndex}`,
         title,
+        questionKeys: [`${bank.id}:${sectionIndex}-${questionIndex}`],
         mode: "question" as const
       }))));
   }, [lectureMode, subjectId, sectionId]);
@@ -391,6 +407,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
         </div>}
       </section>
     </div>}
+    {current && <LectureQuestionNotes key={current.id} track={current}/>}
     {current && <LectureFollowUps track={current}/>}
     {current && audioUrl && <aside className="lecture-mini-player" aria-label="Компактный плеер">
       <div><small>{current.section}</small><strong>{current.title}</strong><span>{Math.round(currentProgress?.percent || 0)}%</span></div>
@@ -409,6 +426,19 @@ function Lectures({ onBack }: { onBack: () => void }) {
       }) : <div className="empty lecture-queue-empty" role="status">{queueQuery.trim() || unlistenedOnly ? "По выбранным фильтрам ничего не найдено." : "В этой подборке пока нет лекций."}</div>}</div>
     </div>
   </section>;
+}
+
+function LectureQuestionNotes({ track }: { track: LectureTrack }) {
+  const [topicIndex, setTopicIndex] = useState(0);
+  const questions = track.mode === "section" ? track.topics || [] : [track.title];
+  const activeIndex = Math.min(topicIndex, Math.max(questions.length - 1, 0));
+  const question = questions[activeIndex] || track.title;
+  const questionKey = track.questionKeys[activeIndex] || track.questionKeys[0];
+  if (!questionKey) return null;
+  return <div className="lecture-question-notes">
+    {track.mode === "section" && questions.length > 1 && <label className="lecture-note-topic"><span>Заметка к вопросу</span><select value={activeIndex} onChange={(event) => setTopicIndex(Number(event.target.value))}>{questions.map((topic, index) => <option value={index} key={`${track.id}-note-${index}`}>{index + 1}. {topic}</option>)}</select></label>}
+    <QuestionNotes questionKey={questionKey} question={question} contextLabel={`${track.subject} · ${track.section}`}/>
+  </div>;
 }
 
 function LectureFollowUps({ track }: { track: LectureTrack }) {
@@ -518,6 +548,7 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
   const [questionIndex, setQuestionIndex] = useState(0); const question = pool[questionIndex % Math.max(pool.length, 1)] || writtenQuestions[0];
   const draftKey = `exam-written-draft-${subjectId}-${question.id}`;
   const [answer, setAnswer] = useState(() => localStorage.getItem(draftKey) || ""); const [result, setResult] = useState<any>(null); const [loading, setLoading] = useState(false); const [error, setError] = useState("");
+  const answerRef = useRef<HTMLTextAreaElement>(null);
   const selectQuestion = (nextSubject: string, nextSection: number, nextQuestion: number) => {
     const nextBank = questionBanks.find((item) => item.id === nextSubject) || questionBanks[0];
     const safeSection = Math.min(nextSection, Math.max(nextBank.sections.length - 1, 0));
@@ -529,6 +560,16 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
   const check = async () => { setLoading(true); setError(""); setResult(null); try { const response = await fetch("/api/grade/written", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: question.text, answer }) }); const body = await response.json(); if (!response.ok) throw new Error(body.error); setResult(body); } catch (e: any) { setError(e.message || "Ошибка проверки"); } finally { setLoading(false); } };
   const next = () => selectQuestion(subjectId, sectionIndex, (questionIndex + 1) % Math.max(pool.length, 1));
   const random = () => { const randomSection = Math.floor(Math.random() * bank.sections.length); const count = bank.sections[randomSection]?.questions.length || 1; selectQuestion(subjectId, randomSection, Math.floor(Math.random() * count)); };
+  const retry = () => {
+    // Keep an explicit empty value so the next progress snapshot also clears
+    // the old draft in the account instead of letting it return on another device.
+    localStorage.setItem(draftKey, "");
+    setAnswer(""); setResult(null); setError("");
+    window.requestAnimationFrame(() => {
+      answerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      answerRef.current?.focus({ preventScroll: true });
+    });
+  };
   return <section className="task-page written-page"><button className="back" onClick={onBack}>← Выйти</button><div className="task-meta"><span>{activeSubject.short}</span><b>Письменно</b><span>до 25 баллов</span></div>
     <div className="written-picker">
       <label><span>Предмет</span><select value={subjectId} onChange={(e) => selectQuestion(e.target.value, 0, 0)}>{subjects.map((item) => <option key={item.id} value={item.id}>{item.short} — {item.title}</option>)}</select></label>
@@ -536,10 +577,12 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
       <label className="question-picker"><span>Вопрос</span><select value={questionIndex} onChange={(e) => selectQuestion(subjectId, sectionIndex, Number(e.target.value))}>{pool.map((item, i) => <option key={item.id} value={i}>{i + 1}. {item.text}</option>)}</select></label>
       <button onClick={random}>⚄ Случайный</button>
     </div>
-    <p className="eyebrow">{question.section || bank.sections[sectionIndex]?.title} · вопрос {questionIndex + 1}/{pool.length}</p><h2 className="question">{question.text}</h2><textarea className="answer" value={answer} onChange={(e) => {setAnswer(e.target.value); localStorage.setItem(draftKey, e.target.value); setResult(null)}} placeholder="Напиши полный развёрнутый ответ…" />
+    <p className="eyebrow">{question.section || bank.sections[sectionIndex]?.title} · вопрос {questionIndex + 1}/{pool.length}</p><h2 className="question">{question.text}</h2>
+    <QuestionNotes questionKey={`${subjectId}:${question.id}`} question={question.text} contextLabel={`${bank.title} · ${question.section || bank.sections[sectionIndex]?.title}`}/>
+    <textarea ref={answerRef} className="answer" value={answer} onChange={(e) => {setAnswer(e.target.value); localStorage.setItem(draftKey, e.target.value); setResult(null)}} placeholder="Напиши полный развёрнутый ответ…" />
     {error && <div className="feedback error"><strong>Не удалось проверить</strong><p>{error}</p></div>}
     {result && <div className="feedback"><span>{result.level}</span><strong>{result.score} / 25 баллов</strong><p>{result.summary}</p>{result.strengths?.length > 0 && <><h4>Что хорошо</h4><ul>{result.strengths.map((x: string) => <li key={x}>{x}</li>)}</ul></>}{result.missing?.length > 0 && <><h4>Чего не хватило</h4><ul>{result.missing.map((x: string) => <li key={x}>{x}</li>)}</ul></>}<details><summary>Показать пример ответа</summary><p>{result.improvedAnswer}</p></details></div>}
-    <button className="primary" disabled={answer.trim().length < 20 || loading} onClick={check}>{loading ? "Проверяю…" : "Проверить ответ"}</button>{result && <button className="secondary" onClick={next}>Следующий вопрос →</button>}</section>;
+    <button className="primary" disabled={answer.trim().length < 20 || loading} onClick={check}>{loading ? "Проверяю…" : "Проверить ответ"}</button>{result && <><button className="secondary" onClick={retry}>Пройти этот вопрос ещё раз</button><button className="secondary" onClick={next}>Следующий вопрос →</button></>}</section>;
 }
 
 function CodeTask({ subject, onBack }: { subject: Subject; onBack: () => void }) {
@@ -599,8 +642,8 @@ function Exam({ subject, onBack }: { subject: Subject; onBack: () => void }) {
   const [seconds, setSeconds] = useState(3600); const [answers, setAnswers] = useState(["", ""]); const [code, setCode] = useState("public class Main {\n  public static void main(String[] args) {\n    // решение\n  }\n}"); const [loading, setLoading] = useState(false); const [result, setResult] = useState<any>(null); const [error, setError] = useState("");
   useEffect(() => { if (result || seconds <= 0) return; const timer = window.setInterval(() => setSeconds((s) => Math.max(0, s - 1)), 1000); return () => clearInterval(timer); }, [result, seconds]);
   const submit = async () => { setLoading(true); setError(""); try { const gradeTheory = await Promise.all(theory.map(async (q, i) => { const r = await fetch("/api/grade/written", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: q.text, answer: answers[i] }) }); const b = await r.json(); if (!r.ok) throw new Error(b.error); return b; })); const r = await fetch("/api/grade/code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: task.text, code }) }); const codeGrade = await r.json(); if (!r.ok) throw new Error(codeGrade.error); const total = gradeTheory[0].score + gradeTheory[1].score + codeGrade.score; setResult({ theory: gradeTheory, code: codeGrade, total }); localStorage.setItem("exam-last-score", String(total)); theory.forEach((q, i) => gradeTheory[i].improvedAnswer && saveReference({ id: `${subject.id}:${q.id}`, subject: bank.title, section: q.section, question: q.text, answer: gradeTheory[i].improvedAnswer, keyPoints: gradeTheory[i].missing || [], savedAt: new Date().toISOString() })); const progress = readStore<Record<string, TaskProgress>>("exam-task-progress", {}); progress[task.id] = { id: task.id, task: task.text, code, score: codeGrade.score, level: codeGrade.level, completed: codeGrade.score >= 31, updatedAt: new Date().toISOString() }; localStorage.setItem("exam-task-progress", JSON.stringify(progress)); } catch (e: any) { setError(e.message || "Не удалось проверить билет"); } finally { setLoading(false); } };
-  if (result) return <section className="result"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Экзамен завершён</p><h1>{result.total}<span>/100</span></h1><h2>{result.total >= 75 ? "Уверенный результат" : result.total >= 50 ? "Есть база — усилим слабые места" : "Нужна ещё тренировка"}</h2><div className="ticket-scores"><span>Теория 1 <b>{result.theory[0].score}/25</b></span><span>Теория 2 <b>{result.theory[1].score}/25</b></span><span>Задача <b>{result.code.score}/50</b></span></div><button className="primary" onClick={onBack}>На главную</button></section>;
-  return <section className="task-page exam-page"><button className="back" onClick={onBack}>← Прервать</button><div className="task-meta"><span>{subject.short}</span><b>Полный билет</b><span className={seconds < 300 ? "danger" : ""}>{String(Math.floor(seconds / 60)).padStart(2, "0")}:{String(seconds % 60).padStart(2, "0")}</span></div><p className="eyebrow">Вопрос 1 · 25 баллов</p><h2 className="question small">{theory[0].text}</h2><textarea className="answer compact" value={answers[0]} onChange={(e) => setAnswers([e.target.value, answers[1]])} placeholder="Ответ на первый вопрос…"/><p className="eyebrow exam-separator">Вопрос 2 · 25 баллов</p><h2 className="question small">{theory[1].text}</h2><textarea className="answer compact" value={answers[1]} onChange={(e) => setAnswers([answers[0], e.target.value])} placeholder="Ответ на второй вопрос…"/><p className="eyebrow exam-separator">Задача · 50 баллов</p><h2 className="question small">{task.text}</h2><textarea className="code-editor" value={code} onChange={(e) => setCode(e.target.value)} spellCheck={false}/>{error && <div className="feedback error"><p>{error}</p></div>}<button className="primary" disabled={loading || answers.some((a) => a.trim().length < 20) || code.length < 20} onClick={submit}>{loading ? "Проверяю весь билет…" : "Завершить и получить баллы"}</button></section>;
+  if (result) return <section className="result"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Экзамен завершён</p><h1>{result.total}<span>/100</span></h1><h2>{result.total >= 75 ? "Уверенный результат" : result.total >= 50 ? "Есть база — усилим слабые места" : "Нужна ещё тренировка"}</h2><div className="ticket-scores"><span>Теория 1 <b>{result.theory[0].score}/25</b></span><span>Теория 2 <b>{result.theory[1].score}/25</b></span><span>Задача <b>{result.code.score}/50</b></span></div><div className="exam-result-notes"><h3>Заметки к вопросам билета</h3>{theory.map((question, index) => <QuestionNotes key={`${subject.id}:${question.id}`} questionKey={`${subject.id}:${question.id}`} question={question.text} contextLabel={`Вопрос ${index + 1} · ${bank.title} · ${question.section}`}/>)}</div><button className="primary" onClick={onBack}>На главную</button></section>;
+  return <section className="task-page exam-page"><button className="back" onClick={onBack}>← Прервать</button><div className="task-meta"><span>{subject.short}</span><b>Полный билет</b><span className={seconds < 300 ? "danger" : ""}>{String(Math.floor(seconds / 60)).padStart(2, "0")}:{String(seconds % 60).padStart(2, "0")}</span></div><p className="eyebrow">Вопрос 1 · 25 баллов</p><h2 className="question small">{theory[0].text}</h2><QuestionNotes questionKey={`${subject.id}:${theory[0].id}`} question={theory[0].text} contextLabel={`${bank.title} · ${theory[0].section}`}/><textarea className="answer compact" value={answers[0]} onChange={(e) => setAnswers([e.target.value, answers[1]])} placeholder="Ответ на первый вопрос…"/><p className="eyebrow exam-separator">Вопрос 2 · 25 баллов</p><h2 className="question small">{theory[1].text}</h2><QuestionNotes questionKey={`${subject.id}:${theory[1].id}`} question={theory[1].text} contextLabel={`${bank.title} · ${theory[1].section}`}/><textarea className="answer compact" value={answers[1]} onChange={(e) => setAnswers([answers[0], e.target.value])} placeholder="Ответ на второй вопрос…"/><p className="eyebrow exam-separator">Задача · 50 баллов</p><h2 className="question small">{task.text}</h2><textarea className="code-editor" value={code} onChange={(e) => setCode(e.target.value)} spellCheck={false}/>{error && <div className="feedback error"><p>{error}</p></div>}<button className="primary" disabled={loading || answers.some((a) => a.trim().length < 20) || code.length < 20} onClick={submit}>{loading ? "Проверяю весь билет…" : "Завершить и получить баллы"}</button></section>;
 }
 
 export default App;
