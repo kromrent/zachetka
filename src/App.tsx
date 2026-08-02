@@ -4,6 +4,7 @@ import questionBankData from "./question-bank.json";
 import { addListenedRange, migrateLegacyRanges, totalUniqueSeconds, type ListeningRange } from "./listening-progress";
 import { mergeQuestionMiniQuizProgressValues, QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, QuestionMiniQuiz } from "./QuestionMiniQuiz";
 import { mergeQuestionNotesValues, QUESTION_NOTES_OWNER_KEY, QUESTION_NOTES_STORAGE_KEY, QuestionNotes } from "./QuestionNotes";
+import { QUESTION_WRITTEN_ANSWER_MAX_LENGTH, QUESTION_WRITTEN_DRAFT_PREFIX, readQuestionWrittenDraft, writeQuestionWrittenDraft } from "./question-written-draft";
 import { mergeTextLectureProgressValues, TEXT_LECTURE_PROGRESS_STORAGE_KEY, type TextLectureProgressStore } from "./text-lecture-progress";
 
 type Bank = { id: string; title: string; sections: { title: string; questions: string[] }[]; tasks: string[] };
@@ -81,6 +82,9 @@ function App() {
       localStorage.removeItem(QUESTION_NOTES_STORAGE_KEY);
       localStorage.removeItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY);
       localStorage.removeItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY);
+      Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+        .filter((key): key is string => Boolean(key?.startsWith(QUESTION_WRITTEN_DRAFT_PREFIX)))
+        .forEach((key) => localStorage.removeItem(key));
     }
     localStorage.setItem(QUESTION_NOTES_OWNER_KEY, userId);
     if (!sessionStorage.getItem(marker) || !mayImportLocalNotes) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
@@ -98,7 +102,12 @@ function App() {
         if (localTextLectureProgress || remoteTextLectureProgress) localStorage.setItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY, mergeTextLectureProgressValues(remoteTextLectureProgress, localTextLectureProgress));
         window.location.reload();
       }
-      else await syncProgress();
+      else {
+        await syncProgress();
+        // Reset mounted editors too: their React state may still contain the
+        // previous account's text even though localStorage has been cleared.
+        if (!mayImportLocalNotes) window.location.reload();
+      }
     }).catch(() => null);
     const timer = window.setInterval(syncProgress, 5000);
     return () => { clearInterval(timer); syncProgress(); };
@@ -562,8 +571,8 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
   const [sectionIndex, setSectionIndex] = useState(0);
   const pool = bank.sections[sectionIndex]?.questions.map((text, index) => ({ id: `${sectionIndex}-${index}`, subject: subjectId, section: bank.sections[sectionIndex].title, text })) || [];
   const [questionIndex, setQuestionIndex] = useState(0); const question = pool[questionIndex % Math.max(pool.length, 1)] || writtenQuestions[0];
-  const draftKey = `exam-written-draft-${subjectId}-${question.id}`;
-  const [answer, setAnswer] = useState(() => localStorage.getItem(draftKey) || ""); const [result, setResult] = useState<any>(null); const [loading, setLoading] = useState(false); const [error, setError] = useState("");
+  const questionKey = `${subjectId}:${question.id}`;
+  const [answer, setAnswer] = useState(() => readQuestionWrittenDraft(questionKey)); const [result, setResult] = useState<any>(null); const [loading, setLoading] = useState(false); const [error, setError] = useState("");
   const answerRef = useRef<HTMLTextAreaElement>(null);
   const selectQuestion = (nextSubject: string, nextSection: number, nextQuestion: number) => {
     const nextBank = questionBanks.find((item) => item.id === nextSubject) || questionBanks[0];
@@ -571,7 +580,7 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
     const nextText = nextBank.sections[safeSection]?.questions[nextQuestion] || nextBank.sections[safeSection]?.questions[0] || "";
     const nextId = `${safeSection}-${nextText === nextBank.sections[safeSection]?.questions[nextQuestion] ? nextQuestion : 0}`;
     setSubjectId(nextSubject); setSectionIndex(safeSection); setQuestionIndex(nextText === nextBank.sections[safeSection]?.questions[nextQuestion] ? nextQuestion : 0);
-    setAnswer(localStorage.getItem(`exam-written-draft-${nextSubject}-${nextId}`) || ""); setResult(null); setError("");
+    setAnswer(readQuestionWrittenDraft(`${nextSubject}:${nextId}`)); setResult(null); setError("");
   };
   const check = async () => { setLoading(true); setError(""); setResult(null); try { const response = await fetch("/api/grade/written", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: question.text, answer }) }); const body = await response.json(); if (!response.ok) throw new Error(body.error); setResult(body); } catch (e: any) { setError(e.message || "Ошибка проверки"); } finally { setLoading(false); } };
   const next = () => selectQuestion(subjectId, sectionIndex, (questionIndex + 1) % Math.max(pool.length, 1));
@@ -579,7 +588,7 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
   const retry = () => {
     // Keep an explicit empty value so the next progress snapshot also clears
     // the old draft in the account instead of letting it return on another device.
-    localStorage.setItem(draftKey, "");
+    writeQuestionWrittenDraft(questionKey, "");
     setAnswer(""); setResult(null); setError("");
     window.requestAnimationFrame(() => {
       answerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -588,18 +597,19 @@ function Written({ subject, onBack }: { subject: Subject; onBack: () => void }) 
   };
   return <section className="task-page written-page"><button className="back" onClick={onBack}>← Выйти</button><div className="task-meta"><span>{activeSubject.short}</span><b>Письменно</b><span>до 25 баллов</span></div>
     <div className="written-picker">
-      <label><span>Предмет</span><select value={subjectId} onChange={(e) => selectQuestion(e.target.value, 0, 0)}>{subjects.map((item) => <option key={item.id} value={item.id}>{item.short} — {item.title}</option>)}</select></label>
-      <label><span>Тема</span><select value={sectionIndex} onChange={(e) => selectQuestion(subjectId, Number(e.target.value), 0)}>{bank.sections.map((item, i) => <option key={item.title} value={i}>{i + 1}. {item.title} ({item.questions.length})</option>)}</select></label>
-      <label className="question-picker"><span>Вопрос</span><select value={questionIndex} onChange={(e) => selectQuestion(subjectId, sectionIndex, Number(e.target.value))}>{pool.map((item, i) => <option key={item.id} value={i}>{i + 1}. {item.text}</option>)}</select></label>
-      <button onClick={random}>⚄ Случайный</button>
+      <label><span>Предмет</span><select value={subjectId} disabled={loading} onChange={(e) => selectQuestion(e.target.value, 0, 0)}>{subjects.map((item) => <option key={item.id} value={item.id}>{item.short} — {item.title}</option>)}</select></label>
+      <label><span>Тема</span><select value={sectionIndex} disabled={loading} onChange={(e) => selectQuestion(subjectId, Number(e.target.value), 0)}>{bank.sections.map((item, i) => <option key={item.title} value={i}>{i + 1}. {item.title} ({item.questions.length})</option>)}</select></label>
+      <label className="question-picker"><span>Вопрос</span><select value={questionIndex} disabled={loading} onChange={(e) => selectQuestion(subjectId, sectionIndex, Number(e.target.value))}>{pool.map((item, i) => <option key={item.id} value={i}>{i + 1}. {item.text}</option>)}</select></label>
+      <button disabled={loading} onClick={random}>⚄ Случайный</button>
     </div>
     <p className="eyebrow">{question.section || bank.sections[sectionIndex]?.title} · вопрос {questionIndex + 1}/{pool.length}</p><h2 className="question">{question.text}</h2>
-    <QuestionNotes questionKey={`${subjectId}:${question.id}`} question={question.text} contextLabel={`${bank.title} · ${question.section || bank.sections[sectionIndex]?.title}`}/>
-    <QuestionMiniQuiz questionKey={`${subjectId}:${question.id}`} question={question.text} contextLabel={`${bank.title} · ${question.section || bank.sections[sectionIndex]?.title}`}/>
-    <textarea ref={answerRef} className="answer" value={answer} onChange={(e) => {setAnswer(e.target.value); localStorage.setItem(draftKey, e.target.value); setResult(null)}} placeholder="Напиши полный развёрнутый ответ…" />
+    <QuestionNotes questionKey={questionKey} question={question.text} contextLabel={`${bank.title} · ${question.section || bank.sections[sectionIndex]?.title}`}/>
+    <QuestionMiniQuiz questionKey={questionKey} question={question.text} contextLabel={`${bank.title} · ${question.section || bank.sections[sectionIndex]?.title}`}/>
+    <textarea ref={answerRef} className="answer" value={answer} maxLength={QUESTION_WRITTEN_ANSWER_MAX_LENGTH} disabled={loading} onChange={(e) => {setAnswer(e.target.value); writeQuestionWrittenDraft(questionKey, e.target.value); setResult(null)}} placeholder="Напиши полный развёрнутый ответ…" />
+    {answer.length > QUESTION_WRITTEN_ANSWER_MAX_LENGTH && <p className="inline-error">Сократи ответ до {QUESTION_WRITTEN_ANSWER_MAX_LENGTH} символов, чтобы отправить его на проверку.</p>}
     {error && <div className="feedback error"><strong>Не удалось проверить</strong><p>{error}</p></div>}
     {result && <div className="feedback"><span>{result.level}</span><strong>{result.score} / 25 баллов</strong><p>{result.summary}</p>{result.strengths?.length > 0 && <><h4>Что хорошо</h4><ul>{result.strengths.map((x: string) => <li key={x}>{x}</li>)}</ul></>}{result.missing?.length > 0 && <><h4>Чего не хватило</h4><ul>{result.missing.map((x: string) => <li key={x}>{x}</li>)}</ul></>}<details><summary>Показать пример ответа</summary><p>{result.improvedAnswer}</p></details></div>}
-    <button className="primary" disabled={answer.trim().length < 20 || loading} onClick={check}>{loading ? "Проверяю…" : "Проверить ответ"}</button>{result && <><button className="secondary" onClick={retry}>Пройти этот вопрос ещё раз</button><button className="secondary" onClick={next}>Следующий вопрос →</button></>}</section>;
+    <button className="primary" disabled={answer.trim().length < 20 || answer.length > QUESTION_WRITTEN_ANSWER_MAX_LENGTH || loading} onClick={check}>{loading ? "Проверяю…" : "Проверить ответ"}</button>{result && <><button className="secondary" onClick={retry}>Пройти этот вопрос ещё раз</button><button className="secondary" onClick={next}>Следующий вопрос →</button></>}</section>;
 }
 
 function CodeTask({ subject, onBack }: { subject: Subject; onBack: () => void }) {

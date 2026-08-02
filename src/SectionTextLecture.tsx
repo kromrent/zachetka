@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import QuestionMiniQuiz from "./QuestionMiniQuiz";
 import QuestionNotes from "./QuestionNotes";
+import QuestionWrittenPractice from "./QuestionWrittenPractice";
 import type { TextLectureBlock, TextLectureCourse } from "./content/text-lecture-types";
 import {
   defaultTextLectureCourse,
@@ -334,10 +335,16 @@ export function SectionTextLecture() {
       </div>
 
       {chapter.questionKey && <section className="section-text-lecture__practice" aria-label="Материалы для закрепления главы">
-        <h3>Закрепить материал</h3>
-        <p>Запиши важные мысли или проверь понимание коротким тестом.</p>
-        <QuestionNotes questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>
+        <h3>Закрепить вопрос</h3>
+        <p>Сначала ответь по памяти. Затем проверь себя тестом и запиши то, что нужно повторить.</p>
+        {chapter.examQuestion && <QuestionWrittenPractice
+          key={chapter.questionKey}
+          questionKey={chapter.questionKey}
+          question={chapter.examQuestion}
+          contextLabel={contextLabel}
+        />}
         <QuestionMiniQuiz questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>
+        <QuestionNotes questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>
       </section>}
     </article>
 
