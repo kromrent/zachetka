@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { codeTasks, demoQuestions, subjects, writtenQuestions, type Question, type Subject } from "./data";
 import questionBankData from "./question-bank.json";
 import { addListenedRange, migrateLegacyRanges, totalUniqueSeconds, type ListeningRange } from "./listening-progress";
 import { mergeQuestionMiniQuizProgressValues, QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, QuestionMiniQuiz } from "./QuestionMiniQuiz";
 import { mergeQuestionNotesValues, QUESTION_NOTES_OWNER_KEY, QUESTION_NOTES_STORAGE_KEY, QuestionNotes } from "./QuestionNotes";
+import { mergeTextLectureProgressValues, TEXT_LECTURE_PROGRESS_STORAGE_KEY, type TextLectureProgressStore } from "./text-lecture-progress";
 
 type Bank = { id: string; title: string; sections: { title: string; questions: string[] }[]; tasks: string[] };
 const questionBanks = questionBankData as Bank[];
@@ -12,6 +13,7 @@ type TaskProgress = { id: string; task: string; code: string; score: number; lev
 type LectureProgress = { id: string; subject: string; section: string; title: string; listenedSeconds: number; listenedRanges?: ListeningRange[]; positionSeconds?: number; duration: number; percent: number; completed: boolean; updatedAt: string };
 type LectureFollowUp = { id: string; trackId: string; subject: string; section: string; originalQuestion: string; question: string; answer: string; createdAt: string };
 type AccountUser = { id: number; username: string | null; displayName: string; telegram: boolean };
+const SectionTextLecture = lazy(() => import("./SectionTextLecture"));
 const readStore = <T,>(key: string, fallback: T): T => { try { return JSON.parse(localStorage.getItem(key) || "") as T; } catch { return fallback; } };
 const saveReference = (item: SavedReference) => { const current = readStore<Record<string, SavedReference>>("exam-reference-answers", {}); current[item.id] = item; localStorage.setItem("exam-reference-answers", JSON.stringify(current)); };
 const progressSnapshot = () => Object.fromEntries(Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter((key): key is string => Boolean(key?.startsWith("exam-"))).map((key) => [key, localStorage.getItem(key)]));
@@ -78,6 +80,7 @@ function App() {
     if (!mayImportLocalNotes) {
       localStorage.removeItem(QUESTION_NOTES_STORAGE_KEY);
       localStorage.removeItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY);
+      localStorage.removeItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY);
     }
     localStorage.setItem(QUESTION_NOTES_OWNER_KEY, userId);
     if (!sessionStorage.getItem(marker) || !mayImportLocalNotes) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
@@ -85,11 +88,14 @@ function App() {
       if (remote.data && Object.keys(remote.data).length) {
         const localNotes = mayImportLocalNotes ? localStorage.getItem(QUESTION_NOTES_STORAGE_KEY) : null;
         const localQuestionQuizProgress = mayImportLocalNotes ? localStorage.getItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY) : null;
+        const localTextLectureProgress = mayImportLocalNotes ? localStorage.getItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY) : null;
         const remoteNotes = remote.data[QUESTION_NOTES_STORAGE_KEY];
         const remoteQuestionQuizProgress = remote.data[QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY];
+        const remoteTextLectureProgress = remote.data[TEXT_LECTURE_PROGRESS_STORAGE_KEY];
         Object.entries(remote.data).forEach(([key, value]) => typeof value === "string" && localStorage.setItem(key, value));
         if (localNotes || remoteNotes) localStorage.setItem(QUESTION_NOTES_STORAGE_KEY, mergeQuestionNotesValues(remoteNotes, localNotes));
         if (localQuestionQuizProgress || remoteQuestionQuizProgress) localStorage.setItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, mergeQuestionMiniQuizProgressValues(remoteQuestionQuizProgress, localQuestionQuizProgress));
+        if (localTextLectureProgress || remoteTextLectureProgress) localStorage.setItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY, mergeTextLectureProgressValues(remoteTextLectureProgress, localTextLectureProgress));
         window.location.reload();
       }
       else await syncProgress();
@@ -225,7 +231,7 @@ function Home({ done, subject, selectSubject, navigate }: { done: number; subjec
         <button disabled={!bank?.tasks.length} onClick={() => navigate("code", subject)}><i>03</i><span><strong>Написать код</strong><small>{bank?.tasks.length ? `${bank.tasks.length} задач · редактор на телефоне` : "В этом предмете задач нет"}</small></span><b>→</b></button>
         <button onClick={() => navigate("exam", subject)}><i>04</i><span><strong>Полный билет</strong><small>60 минут · 100 баллов</small></span><b>→</b></button>
         <button onClick={() => navigate("answers")}><i>05</i><span><strong>Эталонные ответы</strong><small>Ответы на 21–25 баллов</small></span><b>→</b></button>
-        <button onClick={() => navigate("lectures")}><i>06</i><span><strong>Лекции</strong><small>Слушать ответы по темам в фоне</small></span><b>♫</b></button>
+        <button onClick={() => navigate("lectures")}><i>06</i><span><strong>Лекции</strong><small>Аудио и подробный учебник с нуля</small></span><b>♫</b></button>
       </div>
     </section>
     <section className="exam-format"><p className="eyebrow">Как на экзамене · 60 минут</p><div><span><b>25</b> теория №1</span><span><b>25</b> теория №2</span><span><b>50</b> задача</span><strong>100 баллов</strong></div></section>
@@ -236,7 +242,7 @@ function Home({ done, subject, selectSubject, navigate }: { done: number; subjec
 type LectureTrack = { id: string; subject: string; section: string; sectionKey: string; title: string; mode: "question" | "section"; questionKeys: string[]; topics?: string[]; part?: number; partCount?: number };
 function Lectures({ onBack }: { onBack: () => void }) {
   type LectureTextEntry = { text?: string; source?: "generated" | "transcribed" | "cache"; loading: boolean; error?: string };
-  const [lectureMode, setLectureMode] = useState<"questions" | "sections">("questions");
+  const [lectureMode, setLectureMode] = useState<"questions" | "sections" | "textbook">("questions");
   const [subjectId, setSubjectId] = useState("all"); const [sectionId, setSectionId] = useState("all");
   const [index, setIndex] = useState(() => Number(localStorage.getItem("exam-lecture-index") || 0));
   const [audioUrl, setAudioUrl] = useState(""); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [speed, setSpeed] = useState(1);
@@ -251,6 +257,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const lectureTextRequestsRef = useRef<Record<string, AbortController>>({});
   const sections = subjectId === "all" ? [] : questionBanks.find((bank) => bank.id === subjectId)?.sections || [];
   const tracks = useMemo<LectureTrack[]>(() => {
+    if (lectureMode === "textbook") return [];
     const banks = questionBanks.filter((bank) => subjectId === "all" || bank.id === subjectId);
     if (lectureMode === "sections") return banks.flatMap((bank) => bank.sections.flatMap((section, sectionIndex) => {
       if (sectionId !== "all" && subjectId !== "all" && String(sectionIndex) !== sectionId) return [];
@@ -385,12 +392,13 @@ function Lectures({ onBack }: { onBack: () => void }) {
   const currentLectureText = current ? lectureTextCache[current.id] : undefined;
   return <section className="lectures-page">
     <button className="back" onClick={() => { loadVersionRef.current += 1; recordListening(true); onBack(); }}>← На главную</button>
-    <div className="lecture-head"><div><p className="eyebrow">Фоновое обучение</p><h1>Лекции</h1><p>Слушай отдельные вопросы подряд или одну цельную лекцию по всему разделу.</p></div><span>♫</span></div>
+    <div className="lecture-head"><div><p className="eyebrow">Слушать или читать</p><h1>Лекции</h1><p>Слушай ответы в фоне или изучай подробный учебник, где весь раздел разобран с нуля.</p></div><span>♫</span></div>
     <div className="lecture-mode-tabs">
       <button className={lectureMode === "questions" ? "active" : ""} onClick={() => { if (lectureMode !== "questions") { loadVersionRef.current += 1; setLectureMode("questions"); } }}><strong>Все вопросы</strong><small>каждый вопрос — отдельный трек</small></button>
-      <button className={lectureMode === "sections" ? "active" : ""} onClick={() => { if (lectureMode !== "sections") { loadVersionRef.current += 1; setLectureMode("sections"); } }}><strong>По разделам</strong><small>полноценная связная лекция</small></button>
+      <button className={lectureMode === "sections" ? "active" : ""} onClick={() => { if (lectureMode !== "sections") { loadVersionRef.current += 1; setLectureMode("sections"); } }}><strong>По разделам</strong><small>связная аудиолекция</small></button>
+      <button className={lectureMode === "textbook" ? "active" : ""} onClick={() => { if (lectureMode !== "textbook") { loadVersionRef.current += 1; setLectureMode("textbook"); } }}><strong>Учебник</strong><small>глубоко и с нуля</small></button>
     </div>
-    <div className="lecture-filters">
+    {lectureMode === "textbook" ? <Suspense fallback={<div className="empty" role="status">Открываю учебник…</div>}><SectionTextLecture/></Suspense> : <><div className="lecture-filters">
       <label>Предмет<select value={subjectId} onChange={(e) => { loadVersionRef.current += 1; setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
       <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => { loadVersionRef.current += 1; setSectionId(e.target.value); }}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
     </div>
@@ -431,7 +439,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
         if (previousTrack?.sectionKey === track.sectionKey) return [row];
         return [<div className="lecture-section-divider" key={`section-${track.sectionKey}`}><span>{track.subject}</span><strong>{track.section}</strong></div>, row];
       }) : <div className="empty lecture-queue-empty" role="status">{queueQuery.trim() || unlistenedOnly ? "По выбранным фильтрам ничего не найдено." : "В этой подборке пока нет лекций."}</div>}</div>
-    </div>
+    </div></>}
   </section>;
 }
 
@@ -626,7 +634,8 @@ function Stats({ done, onBack, onOpenSubject }: { done: number; onBack: () => vo
   const taskProgress = readStore<Record<string, TaskProgress>>("exam-task-progress", {}); const completedTasks = Object.values(taskProgress).filter((item) => item.completed).length; const references = Object.keys(readStore("exam-reference-answers", {})).length;
   const lectureProgress = readStore<Record<string, LectureProgress>>("exam-lecture-progress", {}); const completedLectures = Object.values(lectureProgress).filter((item) => item.completed).length; const listenedMinutes = Math.round(Object.values(lectureProgress).reduce((sum, item) => sum + item.listenedSeconds, 0) / 60);
   const questionQuizProgress = readStore<Record<string, { mastered?: boolean }>>(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, {}); const masteredQuestionQuizzes = Object.values(questionQuizProgress).filter((item) => item.mastered).length;
-  return <section className="task-page stats-page"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Прогресс</p><h1 className="stats-title">{done} <span>тестов завершено</span></h1><div className="stats-summary"><span><b>{completedTasks}</b> из 15 задач</span><span><b>{references}</b> эталонов</span><span><b>{masteredQuestionQuizzes}</b> мини-тестов освоено</span><span><b>{completedLectures}</b> аудио засчитано<br/>{listenedMinutes} минут</span><span><b>{localStorage.getItem("exam-last-score") || "—"}</b> последний билет</span></div><div className="stats-subjects">{questionBanks.map((bank) => { const known = readStore<string[]>(`exam-known-${bank.id}`, []); const total = bank.sections.reduce((sum, section) => sum + section.questions.length, 0); const totalAudio = total + bank.sections.reduce((sum, section) => sum + Math.ceil(section.questions.length / 3), 0); const completedAudio = Object.values(lectureProgress).filter((item) => item.completed && (item.id.startsWith(`question-${bank.id}-`) || item.id.startsWith(`full-section-${bank.id}-`))).length; const open = () => { const selected = findSubject(bank.id); if (selected) onOpenSubject(selected); }; return <div role="button" tabIndex={0} aria-label={`Открыть темы: ${bank.title}`} key={bank.id} onClick={open} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } }}><h2>{bank.title}</h2><strong>{Math.round(known.length / total * 100)}%</strong><div className="learn-progress"><i style={{ width: `${known.length / total * 100}%` }}/></div><p className="audio-stat"><span>♫ Прослушано аудио</span><b>{completedAudio}/{totalAudio}</b></p>{bank.sections.map((section, sectionIndex) => { const count = section.questions.filter((_q, i) => known.includes(`${sectionIndex}-${i}`)).length; return <p key={section.title}><span>{section.title}</span><b>{count}/{section.questions.length}</b></p>})}<span className="stats-open">Открыть темы →</span></div>})}</div></section>;
+  const textLectureProgress = readStore<TextLectureProgressStore>(TEXT_LECTURE_PROGRESS_STORAGE_KEY, {}); const completedTextChapters = new Set(Object.entries(textLectureProgress).flatMap(([courseId, item]) => (item.completedChapterIds || []).map((chapterId) => `${courseId}:${chapterId}`))).size;
+  return <section className="task-page stats-page"><button className="back" onClick={onBack}>← На главную</button><p className="eyebrow">Прогресс</p><h1 className="stats-title">{done} <span>тестов завершено</span></h1><div className="stats-summary"><span><b>{completedTasks}</b> из 15 задач</span><span><b>{references}</b> эталонов</span><span><b>{masteredQuestionQuizzes}</b> мини-тестов освоено</span><span><b>{completedTextChapters}</b> глав учебника</span><span><b>{completedLectures}</b> аудио засчитано<br/>{listenedMinutes} минут</span><span><b>{localStorage.getItem("exam-last-score") || "—"}</b> последний билет</span></div><div className="stats-subjects">{questionBanks.map((bank) => { const known = readStore<string[]>(`exam-known-${bank.id}`, []); const total = bank.sections.reduce((sum, section) => sum + section.questions.length, 0); const totalAudio = total + bank.sections.reduce((sum, section) => sum + Math.ceil(section.questions.length / 3), 0); const completedAudio = Object.values(lectureProgress).filter((item) => item.completed && (item.id.startsWith(`question-${bank.id}-`) || item.id.startsWith(`full-section-${bank.id}-`))).length; const open = () => { const selected = findSubject(bank.id); if (selected) onOpenSubject(selected); }; return <div role="button" tabIndex={0} aria-label={`Открыть темы: ${bank.title}`} key={bank.id} onClick={open} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } }}><h2>{bank.title}</h2><strong>{Math.round(known.length / total * 100)}%</strong><div className="learn-progress"><i style={{ width: `${known.length / total * 100}%` }}/></div><p className="audio-stat"><span>♫ Прослушано аудио</span><b>{completedAudio}/{totalAudio}</b></p>{bank.sections.map((section, sectionIndex) => { const count = section.questions.filter((_q, i) => known.includes(`${sectionIndex}-${i}`)).length; return <p key={section.title}><span>{section.title}</span><b>{count}/{section.questions.length}</b></p>})}<span className="stats-open">Открыть темы →</span></div>})}</div></section>;
 }
 
 function AnswerLibrary({ onBack }: { onBack: () => void }) {

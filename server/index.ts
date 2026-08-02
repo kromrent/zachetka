@@ -268,6 +268,41 @@ app.put("/api/progress", authRequired, async (request, response) => {
     }
     if (Object.keys(questionQuizProgress).length) merged["exam-question-quiz-progress"] = JSON.stringify(questionQuizProgress);
 
+    // A course may be read on several devices. Keep the newest position, but
+    // union completed chapters so an older snapshot cannot mark them unread.
+    const readTextLectureProgress = (value: unknown) => {
+      try {
+        const result = typeof value === "string" ? JSON.parse(value) : value;
+        if (!result || typeof result !== "object" || Array.isArray(result)) return {} as Record<string, { currentChapterId: string; completedChapterIds: string[]; updatedAt: string }>;
+        return Object.fromEntries(Object.entries(result).flatMap(([courseId, item]) => {
+          if (!courseId || courseId.length > 160 || !item || typeof item !== "object" || Array.isArray(item)) return [];
+          const progress = item as Record<string, unknown>;
+          if (typeof progress.currentChapterId !== "string" || typeof progress.updatedAt !== "string") return [];
+          const completedChapterIds = Array.isArray(progress.completedChapterIds)
+            ? [...new Set(progress.completedChapterIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500)
+            : [];
+          return [[courseId, { currentChapterId: progress.currentChapterId.slice(0, 160), completedChapterIds, updatedAt: progress.updatedAt }]];
+        })) as Record<string, { currentChapterId: string; completedChapterIds: string[]; updatedAt: string }>;
+      } catch { return {} as Record<string, { currentChapterId: string; completedChapterIds: string[]; updatedAt: string }>; }
+    };
+    const textLectureProgress = readTextLectureProgress(current["exam-text-lecture-progress"]);
+    for (const [courseId, candidate] of Object.entries(readTextLectureProgress(parsed.data["exam-text-lecture-progress"]))) {
+      const saved = textLectureProgress[courseId];
+      if (!saved) {
+        textLectureProgress[courseId] = candidate;
+        continue;
+      }
+      const savedAt = Date.parse(saved.updatedAt) || 0;
+      const candidateAt = Date.parse(candidate.updatedAt) || 0;
+      const newest = candidateAt >= savedAt ? candidate : saved;
+      textLectureProgress[courseId] = {
+        currentChapterId: newest.currentChapterId,
+        completedChapterIds: [...new Set([...saved.completedChapterIds, ...candidate.completedChapterIds])].slice(0, 500),
+        updatedAt: newest.updatedAt
+      };
+    }
+    if (Object.keys(textLectureProgress).length) merged["exam-text-lecture-progress"] = JSON.stringify(textLectureProgress);
+
     await connection.query("INSERT INTO progress(user_id,payload,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP", [response.locals.user.id, merged]);
     await connection.query("COMMIT");
     response.json({ ok: true });
