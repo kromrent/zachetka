@@ -4,6 +4,7 @@ import questionBankData from "./question-bank.json";
 import { addListenedRange, migrateLegacyRanges, totalUniqueSeconds, type ListeningRange } from "./listening-progress";
 import { mergeQuestionMiniQuizProgressValues, QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, QuestionMiniQuiz } from "./QuestionMiniQuiz";
 import { mergeQuestionNotesValues, QUESTION_NOTES_OWNER_KEY, QUESTION_NOTES_STORAGE_KEY, QuestionNotes } from "./QuestionNotes";
+import { mergeQuestionFollowUpsValues, QUESTION_FOLLOWUPS_CHANGED_EVENT, QUESTION_FOLLOWUPS_STORAGE_KEY, readQuestionFollowUps, writeQuestionFollowUps, type QuestionFollowUpsChangedDetail, type SavedQuestionFollowUp } from "./question-followups";
 import { QUESTION_WRITTEN_ANSWER_MAX_LENGTH, QUESTION_WRITTEN_DRAFT_PREFIX, readQuestionWrittenDraft, writeQuestionWrittenDraft } from "./question-written-draft";
 import { mergeTextLectureProgressValues, TEXT_LECTURE_PROGRESS_STORAGE_KEY, type TextLectureProgressStore } from "./text-lecture-progress";
 
@@ -12,7 +13,6 @@ const questionBanks = questionBankData as Bank[];
 type SavedReference = { id: string; subject: string; section: string; question: string; answer: string; keyPoints: string[]; savedAt: string };
 type TaskProgress = { id: string; task: string; code: string; score: number; level: string; completed: boolean; updatedAt: string };
 type LectureProgress = { id: string; subject: string; section: string; title: string; listenedSeconds: number; listenedRanges?: ListeningRange[]; positionSeconds?: number; duration: number; percent: number; completed: boolean; updatedAt: string };
-type LectureFollowUp = { id: string; trackId: string; subject: string; section: string; originalQuestion: string; question: string; answer: string; createdAt: string };
 type AccountUser = { id: number; username: string | null; displayName: string; telegram: boolean };
 const SectionTextLecture = lazy(() => import("./SectionTextLecture"));
 const readStore = <T,>(key: string, fallback: T): T => { try { return JSON.parse(localStorage.getItem(key) || "") as T; } catch { return fallback; } };
@@ -74,39 +74,43 @@ function App() {
     if (!user) return;
     const marker = `zachetka-synced-${user.id}`;
     const userId = String(user.id);
-    const notesOwner = localStorage.getItem(QUESTION_NOTES_OWNER_KEY);
-    const mayImportLocalNotes = !notesOwner || notesOwner === userId;
+    const personalDataOwner = localStorage.getItem(QUESTION_NOTES_OWNER_KEY);
+    const mayImportLocalPersonalData = !personalDataOwner || personalDataOwner === userId;
     // localStorage is shared by every login in this browser. Do not import a
-    // previous account's personal notes or quiz results when somebody else signs in.
-    if (!mayImportLocalNotes) {
+    // previous account's personal study data when somebody else signs in.
+    if (!mayImportLocalPersonalData) {
       localStorage.removeItem(QUESTION_NOTES_STORAGE_KEY);
       localStorage.removeItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY);
       localStorage.removeItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY);
+      localStorage.removeItem(QUESTION_FOLLOWUPS_STORAGE_KEY);
       Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
         .filter((key): key is string => Boolean(key?.startsWith(QUESTION_WRITTEN_DRAFT_PREFIX)))
         .forEach((key) => localStorage.removeItem(key));
     }
     localStorage.setItem(QUESTION_NOTES_OWNER_KEY, userId);
-    if (!sessionStorage.getItem(marker) || !mayImportLocalNotes) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
+    if (!sessionStorage.getItem(marker) || !mayImportLocalPersonalData) fetch("/api/progress").then((r) => r.json()).then(async (remote) => {
       sessionStorage.setItem(marker, "1");
       if (remote.data && Object.keys(remote.data).length) {
-        const localNotes = mayImportLocalNotes ? localStorage.getItem(QUESTION_NOTES_STORAGE_KEY) : null;
-        const localQuestionQuizProgress = mayImportLocalNotes ? localStorage.getItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY) : null;
-        const localTextLectureProgress = mayImportLocalNotes ? localStorage.getItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY) : null;
+        const localNotes = mayImportLocalPersonalData ? localStorage.getItem(QUESTION_NOTES_STORAGE_KEY) : null;
+        const localQuestionQuizProgress = mayImportLocalPersonalData ? localStorage.getItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY) : null;
+        const localTextLectureProgress = mayImportLocalPersonalData ? localStorage.getItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY) : null;
+        const localQuestionFollowUps = mayImportLocalPersonalData ? localStorage.getItem(QUESTION_FOLLOWUPS_STORAGE_KEY) : null;
         const remoteNotes = remote.data[QUESTION_NOTES_STORAGE_KEY];
         const remoteQuestionQuizProgress = remote.data[QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY];
         const remoteTextLectureProgress = remote.data[TEXT_LECTURE_PROGRESS_STORAGE_KEY];
+        const remoteQuestionFollowUps = remote.data[QUESTION_FOLLOWUPS_STORAGE_KEY];
         Object.entries(remote.data).forEach(([key, value]) => typeof value === "string" && localStorage.setItem(key, value));
         if (localNotes || remoteNotes) localStorage.setItem(QUESTION_NOTES_STORAGE_KEY, mergeQuestionNotesValues(remoteNotes, localNotes));
         if (localQuestionQuizProgress || remoteQuestionQuizProgress) localStorage.setItem(QUESTION_MINI_QUIZ_PROGRESS_STORAGE_KEY, mergeQuestionMiniQuizProgressValues(remoteQuestionQuizProgress, localQuestionQuizProgress));
         if (localTextLectureProgress || remoteTextLectureProgress) localStorage.setItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY, mergeTextLectureProgressValues(remoteTextLectureProgress, localTextLectureProgress));
+        if (localQuestionFollowUps || remoteQuestionFollowUps) localStorage.setItem(QUESTION_FOLLOWUPS_STORAGE_KEY, mergeQuestionFollowUpsValues(remoteQuestionFollowUps, localQuestionFollowUps));
         window.location.reload();
       }
       else {
         await syncProgress();
         // Reset mounted editors too: their React state may still contain the
         // previous account's text even though localStorage has been cleared.
-        if (!mayImportLocalNotes) window.location.reload();
+        if (!mayImportLocalPersonalData) window.location.reload();
       }
     }).catch(() => null);
     const timer = window.setInterval(syncProgress, 5000);
@@ -407,7 +411,7 @@ function Lectures({ onBack }: { onBack: () => void }) {
       <button className={lectureMode === "sections" ? "active" : ""} onClick={() => { if (lectureMode !== "sections") { loadVersionRef.current += 1; setLectureMode("sections"); } }}><strong>По разделам</strong><small>связная аудиолекция</small></button>
       <button className={lectureMode === "textbook" ? "active" : ""} onClick={() => { if (lectureMode !== "textbook") { loadVersionRef.current += 1; setLectureMode("textbook"); } }}><strong>Учебник</strong><small>глубоко и с нуля</small></button>
     </div>
-    {lectureMode === "textbook" ? <Suspense fallback={<div className="empty" role="status">Открываю учебник…</div>}><SectionTextLecture/></Suspense> : <><div className="lecture-filters">
+    {lectureMode === "textbook" ? <Suspense fallback={<div className="empty" role="status">Открываю учебник…</div>}><SectionTextLecture onProgressSync={syncProgress}/></Suspense> : <><div className="lecture-filters">
       <label>Предмет<select value={subjectId} onChange={(e) => { loadVersionRef.current += 1; setSubjectId(e.target.value); setSectionId("all"); }}><option value="all">Все предметы</option>{questionBanks.map((bank) => <option value={bank.id} key={bank.id}>{bank.title}</option>)}</select></label>
       <label>Раздел<select value={sectionId} disabled={subjectId === "all"} onChange={(e) => { loadVersionRef.current += 1; setSectionId(e.target.value); }}><option value="all">Все разделы</option>{sections.map((section, i) => <option value={i} key={section.title}>{section.title}</option>)}</select></label>
     </div>
@@ -467,8 +471,7 @@ function LectureQuestionPractice({ track }: { track: LectureTrack }) {
 }
 
 function LectureFollowUps({ track }: { track: LectureTrack }) {
-  const storageKey = "exam-lecture-followups";
-  const [items, setItems] = useState<LectureFollowUp[]>(() => readStore(storageKey, []));
+  const [items, setItems] = useState<SavedQuestionFollowUp[]>(readQuestionFollowUps);
   const [topicIndex, setTopicIndex] = useState(0);
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
@@ -476,8 +479,26 @@ function LectureFollowUps({ track }: { track: LectureTrack }) {
   const requestRef = useRef<AbortController | null>(null);
   useEffect(() => { requestRef.current?.abort(); requestRef.current = null; setTopicIndex(0); setQuestion(""); setError(""); setLoading(false); }, [track.id]);
   useEffect(() => () => requestRef.current?.abort(), []);
+  useEffect(() => {
+    const applyStoredItems = () => setItems(readQuestionFollowUps());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === QUESTION_FOLLOWUPS_STORAGE_KEY) applyStoredItems();
+    };
+    const onChanged = (event: Event) => {
+      const detail = (event as CustomEvent<QuestionFollowUpsChangedDetail>).detail;
+      if (Array.isArray(detail?.items)) setItems(detail.items);
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(QUESTION_FOLLOWUPS_CHANGED_EVENT, onChanged);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(QUESTION_FOLLOWUPS_CHANGED_EVENT, onChanged);
+    };
+  }, []);
   const topics = track.topics || [];
-  const originalQuestion = track.mode === "section" ? topics[Math.min(topicIndex, Math.max(0, topics.length - 1))] || track.title : track.title;
+  const activeTopicIndex = Math.min(topicIndex, Math.max(0, topics.length - 1));
+  const originalQuestion = track.mode === "section" ? topics[activeTopicIndex] || track.title : track.title;
+  const activeQuestionKey = track.mode === "section" ? track.questionKeys[activeTopicIndex] : track.questionKeys[0];
   const currentItems = items.filter((item) => item.trackId === track.id);
   const ask = async () => {
     const followUp = question.trim();
@@ -491,7 +512,7 @@ function LectureFollowUps({ track }: { track: LectureTrack }) {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || "Не удалось получить ответ");
       if (controller.signal.aborted) return;
-      const item: LectureFollowUp = {
+      const item: SavedQuestionFollowUp = {
         id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         trackId: track.id,
         subject: track.subject,
@@ -499,10 +520,18 @@ function LectureFollowUps({ track }: { track: LectureTrack }) {
         originalQuestion,
         question: followUp,
         answer: body.answer,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        questionKey: activeQuestionKey,
+        source: "audio"
       };
-      const next = [item, ...items];
-      setItems(next); localStorage.setItem(storageKey, JSON.stringify(next)); setQuestion(""); syncProgress();
+      const storedItems = readQuestionFollowUps();
+      const next = [item, ...storedItems.filter((saved) => saved.id !== item.id)];
+      setItems(next);
+      try {
+        writeQuestionFollowUps(next); setQuestion(""); syncProgress();
+      } catch {
+        setError("Ответ получен, но сохранить его на этом устройстве не удалось");
+      }
     } catch (e: any) { if (e?.name !== "AbortError" && requestRef.current === controller) setError(e.message || "Уточнение сейчас недоступно"); } finally { if (requestRef.current === controller) { requestRef.current = null; setLoading(false); } }
   };
   return <details className="lecture-followups">

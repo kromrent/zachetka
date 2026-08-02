@@ -2,6 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import QuestionMiniQuiz from "./QuestionMiniQuiz";
 import QuestionNotes from "./QuestionNotes";
 import QuestionWrittenPractice from "./QuestionWrittenPractice";
+import TextbookFollowUps from "./TextbookFollowUps";
 import type { TextLectureBlock, TextLectureCourse } from "./content/text-lecture-types";
 import {
   defaultTextLectureCourse,
@@ -104,7 +105,11 @@ function TextLectureContentBlock({ block }: { block: TextLectureBlock }) {
   </Tag>;
 }
 
-export function SectionTextLecture() {
+type SectionTextLectureProps = {
+  onProgressSync?: () => void | Promise<unknown>;
+};
+
+export function SectionTextLecture({ onProgressSync }: SectionTextLectureProps) {
   const [selectedCourseId, setSelectedCourseId] = useState(readSelectedCourseId);
   const course = getTextLectureCourse(selectedCourseId);
   const [progress, setProgress] = useState<TextLectureCourseProgress>(() => readCourseProgress(course));
@@ -236,6 +241,9 @@ export function SectionTextLecture() {
 
   const question = chapter.examQuestion || chapter.title;
   const contextLabel = `${course.subject} · ${course.section}`;
+  const followUpContext = chapter.examQuestion
+    ? `${chapter.examQuestion}\n\nГлава «${chapter.title}»: ${chapter.summary}`
+    : `Глава «${chapter.title}»: ${chapter.summary}`;
 
   return <section className="section-text-lecture" aria-label={course.title}>
     <section className="section-text-lecture__course-picker" aria-labelledby={coursePickerHeadingId}>
@@ -334,18 +342,30 @@ export function SectionTextLecture() {
         </button>
       </div>
 
-      {chapter.questionKey && <section className="section-text-lecture__practice" aria-label="Материалы для закрепления главы">
-        <h3>Закрепить вопрос</h3>
-        <p>Сначала ответь по памяти. Затем проверь себя тестом и запиши то, что нужно повторить.</p>
-        {chapter.examQuestion && <QuestionWrittenPractice
+      <section className="section-text-lecture__practice" aria-label="Материалы для закрепления главы">
+        <h3>{chapter.questionKey ? "Закрепить вопрос" : "Разобраться в главе"}</h3>
+        <p>{chapter.questionKey
+          ? "Сначала ответь по памяти, проверь себя тестом, задай вопрос по непонятному и сохрани выводы в заметках."
+          : "Сформулируй, что именно осталось непонятно, — короткий текстовый ответ сохранится в аккаунте."}</p>
+        {chapter.questionKey && chapter.examQuestion && <QuestionWrittenPractice
           key={chapter.questionKey}
           questionKey={chapter.questionKey}
           question={chapter.examQuestion}
           contextLabel={contextLabel}
         />}
-        <QuestionMiniQuiz questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>
-        <QuestionNotes questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>
-      </section>}
+        {chapter.questionKey && <QuestionMiniQuiz questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>}
+        <TextbookFollowUps
+          key={`textbook:${course.id}:${chapter.id}`}
+          contextId={`textbook:${course.id}:${chapter.id}`}
+          subject={course.subject}
+          section={course.section}
+          originalQuestion={followUpContext}
+          contextTitle={chapter.examQuestion ? "Экзаменационный вопрос и контекст главы" : "Тема этой главы"}
+          questionKey={chapter.questionKey}
+          onSaved={onProgressSync}
+        />
+        {chapter.questionKey && <QuestionNotes questionKey={chapter.questionKey} question={question} contextLabel={contextLabel}/>}
+      </section>
     </article>
 
     <nav className="section-text-lecture__chapter-nav" aria-label="Переход между главами">

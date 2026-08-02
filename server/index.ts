@@ -555,7 +555,7 @@ app.get("/api/status", (_request, response) => response.json({
   questionQuiz: { model: client ? quizModel : null, questionsPerTopic: 8, cache: "postgresql" },
   lectureAudio: { bitrate: lectureAudioBitrate, compression: Boolean(ffmpegPath), speed: lectureSpeechSpeed, maxCharactersPerPart: lectureSpeechChunkMaxCharacters },
   lectureText: { transcriptionModel: lectureTranscribeModel },
-  features: { lectureFollowUps: true, lectureText: true, uniqueListeningProgress: true, questionNotes: true, writtenRetry: true, questionQuiz: true }
+  features: { lectureFollowUps: true, textbookFollowUps: true, lectureText: true, uniqueListeningProgress: true, questionNotes: true, writtenRetry: true, questionQuiz: true }
 }));
 
 app.post("/api/grade/written", authRequired, async (request, response) => {
@@ -688,8 +688,8 @@ app.post("/api/lectures/follow-up", authRequired, async (request, response) => {
       model,
       reasoning: { effort: "low" },
       max_output_tokens: 600,
-      instructions: `Ответь по-русски точно, понятно и строго в контексте исходного экзаменационного вопроса. Отвечай только на заданное уточнение и не повторяй весь основной ответ. Если уточнение двусмысленно, кратко обозначь принятое допущение. Используй короткие абзацы; не используй markdown-таблицы.`,
-      input: `ИСХОДНЫЙ ЭКЗАМЕНАЦИОННЫЙ ВОПРОС:\n${parsed.data.originalQuestion}\n\nУТОЧНЯЮЩИЙ ВОПРОС:\n${parsed.data.followUp}`
+      instructions: `Ответь по-русски точно, понятно и строго в контексте исходного экзаменационного вопроса или темы учебника. Отвечай только на заданное уточнение и не повторяй весь основной материал. Если уточнение двусмысленно, кратко обозначь принятое допущение. Используй короткие абзацы; не используй markdown-таблицы.`,
+      input: `ИСХОДНЫЙ ВОПРОС ИЛИ ТЕМА:\n${parsed.data.originalQuestion}\n\nУТОЧНЯЮЩИЙ ВОПРОС:\n${parsed.data.followUp}`
     });
     const answer = result.output_text.trim();
     if (!answer) throw new Error("OpenAI вернул пустой ответ на уточняющий вопрос");
