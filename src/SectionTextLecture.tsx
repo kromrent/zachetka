@@ -1,11 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import QuestionMiniQuiz from "./QuestionMiniQuiz";
 import QuestionNotes from "./QuestionNotes";
+import type { TextLectureBlock, TextLectureCourse } from "./content/text-lecture-types";
 import {
-  industrialAutomationCourse,
-  type TextLectureBlock,
-  type TextLectureCourse
-} from "./content/industrial-automation-course";
+  defaultTextLectureCourse,
+  getTextLectureCourse,
+  TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY,
+  textLectureCourses
+} from "./content/text-lecture-courses";
 import {
   parseTextLectureProgressStore,
   TEXT_LECTURE_PROGRESS_CHANGED_EVENT,
@@ -15,6 +17,7 @@ import {
 } from "./text-lecture-progress";
 
 export { TEXT_LECTURE_PROGRESS_CHANGED_EVENT, TEXT_LECTURE_PROGRESS_STORAGE_KEY } from "./text-lecture-progress";
+export { TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY } from "./content/text-lecture-courses";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -45,7 +48,11 @@ const normalizeCourseProgress = (
 
 const readProgressStore = (): TextLectureProgressStore => {
   if (typeof window === "undefined") return {};
-  return parseTextLectureProgressStore(window.localStorage.getItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY));
+  try {
+    return parseTextLectureProgressStore(window.localStorage.getItem(TEXT_LECTURE_PROGRESS_STORAGE_KEY));
+  } catch {
+    return {};
+  }
 };
 
 const readCourseProgress = (course: TextLectureCourse) =>
@@ -59,6 +66,17 @@ const writeCourseProgress = (course: TextLectureCourse, progress: TextLectureCou
   window.dispatchEvent(new CustomEvent(TEXT_LECTURE_PROGRESS_CHANGED_EVENT, {
     detail: { courseId: course.id, progress }
   }));
+};
+
+const readSelectedCourseId = () => {
+  if (typeof window === "undefined") return defaultTextLectureCourse.id;
+  try {
+    return getTextLectureCourse(
+      window.localStorage.getItem(TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY)
+    ).id;
+  } catch {
+    return defaultTextLectureCourse.id;
+  }
 };
 
 const blockDefaultTitle: Record<TextLectureBlock["kind"], string> = {
@@ -86,12 +104,15 @@ function TextLectureContentBlock({ block }: { block: TextLectureBlock }) {
 }
 
 export function SectionTextLecture() {
-  const course = industrialAutomationCourse;
+  const [selectedCourseId, setSelectedCourseId] = useState(readSelectedCourseId);
+  const course = getTextLectureCourse(selectedCourseId);
   const [progress, setProgress] = useState<TextLectureCourseProgress>(() => readCourseProgress(course));
   const [contentsOpen, setContentsOpen] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [selectionSaveError, setSelectionSaveError] = useState("");
   const headingRef = useRef<HTMLHeadingElement>(null);
   const initialChapterRef = useRef(progress.currentChapterId);
+  const coursePickerHeadingId = `${useId()}-text-lecture-courses`;
   const contentsId = `${useId()}-text-lecture-contents`;
   const glossaryId = `${useId()}-text-lecture-glossary`;
 
@@ -111,6 +132,25 @@ export function SectionTextLecture() {
       setSaveError("");
     } catch {
       setSaveError("Не удалось сохранить прогресс на этом устройстве");
+    }
+  };
+
+  const selectCourse = (nextCourseId: string, persistSelection = true) => {
+    const nextCourse = getTextLectureCourse(nextCourseId);
+    if (nextCourse.id !== course.id) {
+      setSelectedCourseId(nextCourse.id);
+      setProgress(readCourseProgress(nextCourse));
+      setContentsOpen(false);
+      setSaveError("");
+      initialChapterRef.current = "";
+    }
+
+    if (!persistSelection || typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY, nextCourse.id);
+      setSelectionSaveError("");
+    } catch {
+      setSelectionSaveError("Раздел открыт, но запомнить выбор на этом устройстве не получилось");
     }
   };
 
@@ -167,6 +207,25 @@ export function SectionTextLecture() {
     };
   }, [course]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      if (window.localStorage.getItem(TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY) !== course.id) {
+        window.localStorage.setItem(TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY, course.id);
+      }
+      setSelectionSaveError("");
+    } catch {
+      setSelectionSaveError("Выбранный раздел не получится запомнить на этом устройстве");
+    }
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== TEXT_LECTURE_SELECTED_COURSE_STORAGE_KEY) return;
+      selectCourse(getTextLectureCourse(event.newValue).id, false);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [course.id]);
+
   if (!chapter) {
     return <section className="section-text-lecture section-text-lecture--empty">
       <h2>Текстовая лекция пока пуста</h2>
@@ -178,6 +237,32 @@ export function SectionTextLecture() {
   const contextLabel = `${course.subject} · ${course.section}`;
 
   return <section className="section-text-lecture" aria-label={course.title}>
+    <section className="section-text-lecture__course-picker" aria-labelledby={coursePickerHeadingId}>
+      <header>
+        <p>Текстовые лекции</p>
+        <h2 id={coursePickerHeadingId}>Выбери раздел</h2>
+      </header>
+      <div className="section-text-lecture__course-options">
+        {textLectureCourses.map((item) => {
+          const selected = item.id === course.id;
+          return <button
+            type="button"
+            key={item.id}
+            className={selected ? "is-selected" : ""}
+            aria-pressed={selected}
+            onClick={() => selectCourse(item.id)}
+          >
+            <span><small>{item.subject}</small><strong>{item.section}</strong></span>
+            <span className="section-text-lecture__course-option-meta">
+              <small>{item.chapters.length} глав · ≈ {item.estimatedMinutes} минут</small>
+              <b aria-hidden="true">{selected ? "Открыт" : "Выбрать →"}</b>
+            </span>
+          </button>;
+        })}
+      </div>
+      {selectionSaveError && <p className="section-text-lecture__selection-error" role="status">{selectionSaveError}</p>}
+    </section>
+
     <header className="section-text-lecture__hero">
       <p className="section-text-lecture__eyebrow">Подробный курс с нуля</p>
       <h2>{course.title}</h2>

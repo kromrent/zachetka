@@ -1807,6 +1807,117 @@ details.lecture-followups > :last-child,
   color: var(--ink);
 }
 
+.section-text-lecture__course-picker {
+  margin-bottom: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--paper-raised);
+  box-shadow: 0 8px 24px rgb(23 27 35 / 5%);
+}
+
+.section-text-lecture__course-picker > header p {
+  margin: 0 0 4px;
+  color: #6155aa;
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.09em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.section-text-lecture__course-picker > header h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 21px;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.section-text-lecture__course-options {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.section-text-lecture__course-options button {
+  display: flex;
+  width: 100%;
+  min-height: 92px;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 13px;
+  padding: 14px;
+  border: 1px solid #aaa69c;
+  border-radius: var(--radius-md);
+  background: var(--paper-soft);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.section-text-lecture__course-options button.is-selected {
+  border-color: #776bc1;
+  background: var(--violet-soft);
+  box-shadow: inset 0 0 0 1px #776bc1;
+}
+
+.section-text-lecture__course-options button:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.section-text-lecture__course-options button > span:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.section-text-lecture__course-options button small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+.section-text-lecture__course-options button > span:first-child small {
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.section-text-lecture__course-options button strong {
+  font-size: 15px;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
+.section-text-lecture__course-option-meta {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.section-text-lecture__course-option-meta b {
+  flex: 0 0 auto;
+  color: #6155aa;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.section-text-lecture__course-options button.is-selected .section-text-lecture__course-option-meta b {
+  color: #365619;
+}
+
+.section-text-lecture__selection-error {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.5;
+}
+
 @media (min-width: 701px) {
   .lecture-mode-tabs {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2438,6 +2549,7 @@ details.lecture-followups > :last-child,
 }
 
 @media (hover: hover) {
+  .section-text-lecture__course-options button:not(.is-selected):hover,
   .section-text-lecture__contents nav button:hover,
   .section-text-lecture__chapter-nav button:not(:disabled):hover,
   .section-text-lecture__contents-toggle:hover,
@@ -2447,6 +2559,14 @@ details.lecture-followups > :last-child,
 }
 
 @media (min-width: 701px) {
+  .section-text-lecture__course-picker {
+    padding: 20px;
+  }
+
+  .section-text-lecture__course-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .section-text-lecture__hero {
     padding: clamp(28px, 5vw, 48px);
   }
